@@ -54,7 +54,13 @@ io.on("connection",socket=>{
     socket.emit("room-users",roomUsers(room));
     socket.to(room).emit("user-joined",{id:socket.id,name});
 
-    if(calls.has(room))socket.emit("call-host",calls.get(room));
+    if(calls.has(room)){
+      const host=calls.get(room);
+      socket.emit("call-host",host);
+      socket.emit("call-state",{active:true,host,ready:[...readySet(room)]});
+    }else{
+      socket.emit("call-state",{active:false,host:null,ready:[]});
+    }
   });
 
   socket.on("chat",({room,text})=>{
@@ -76,17 +82,22 @@ io.on("connection",socket=>{
       io.to(room).emit("system",socket.data.name+" criou uma call.");
       broadcastUsers(room);
     }
+    // Sempre devolve o host atual ao solicitante. Isso é importante quando
+    // alguém entra numa call existente antes de receber o evento call-host.
+    socket.emit("call-host",calls.get(room));
+    socket.emit("call-state",{active:true,host:calls.get(room),ready:[...readySet(room)]});
   });
 
   socket.on("call-ready",({room})=>{
     if(room!==socket.data.room||!calls.has(room))return;
     const set=readySet(room);
     set.add(socket.id);
+    const host=calls.get(room);
+    socket.emit("call-host",host);
 
     const others=[...set].filter(id=>id!==socket.id&&validMember(socket,id));
     socket.emit("call-ready-users",others);
 
-    const host=calls.get(room);
     if(host&&host!==socket.id){
       io.to(host).emit("call-participant-ready",{
         id:socket.id,name:socket.data.name
@@ -120,8 +131,7 @@ io.on("connection",socket=>{
     io.to(to).emit("call-removed");
     io.to(room).emit("system",socket.data.name+" removeu "+name+" da call.");
     // Remove apenas da call: a pessoa continua no chat.
-    socket.to(to).emit("call-participant-left",{id:socket.id});
-    io.to(to).emit("call-kicked");
+    io.to(room).emit("call-participant-left",{id:to});
   });
 
   socket.on("call-end",({room})=>{
@@ -130,6 +140,7 @@ io.on("connection",socket=>{
     callReady.delete(room);
     for(const k of callMutes.keys())if(k.startsWith(room+":"))callMutes.delete(k);
     io.to(room).emit("call-ended");
+    io.to(room).emit("call-state",{active:false,host:null,ready:[]});
     io.to(room).emit("system",socket.data.name+" encerrou a call.");
     broadcastUsers(room);
   });
@@ -161,12 +172,18 @@ io.on("connection",socket=>{
       const next=[...r.values()][0];
       if(next){
         calls.set(room,next.id);
-        readySet(room).add(next.id);
+        // O novo criador só fica pronto se já estiver na call.
+        // Como o servidor não conhece a interface local, mantemos o estado
+        // pronto apenas se o participante já estava marcado como ready.
+        const nextWasReady=callReady.get(room)?.has(next.id);
+        if(nextWasReady) readySet(room).add(next.id);
         io.to(room).emit("call-host",next.id);
+        io.to(room).emit("call-state",{active:true,host:next.id,ready:[...readySet(room)]});
       }else{
         callReady.delete(room);
+        io.to(room).emit("call-ended");
+        io.to(room).emit("call-state",{active:false,host:null,ready:[]});
       }
-      io.to(room).emit("call-ended");
     }
 
     socket.to(room).emit("user-left",{id:socket.id,name:socket.data.name});
