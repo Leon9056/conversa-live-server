@@ -2,11 +2,18 @@ const express=require("express"),http=require("http"),cors=require("cors"),crypt
 const app=express();
 app.set("trust proxy",1);
 const configuredOrigins=String(process.env.FRONTEND_URL||"").split(",").map(v=>v.trim()).filter(Boolean);
-const corsOptions={origin:(origin,cb)=>{if(!origin||configuredOrigins.length===0||configuredOrigins.includes("*")||configuredOrigins.includes(origin))return cb(null,true);return cb(null,false)},methods:["GET","POST","OPTIONS"],credentials:false};
+function allowOrigin(origin){
+  if(!origin)return true;
+  if(configuredOrigins.length===0||configuredOrigins.includes("*")||configuredOrigins.includes(origin))return true;
+  if(origin==="https://freechat-ten.vercel.app")return true;
+  if(/^https:\/\/[a-z0-9-]+(?:-[a-z0-9-]+)*\.vercel\.app$/i.test(origin))return true;
+  return false;
+}
+const corsOptions={origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST","OPTIONS"],credentials:false};
 app.use(cors(corsOptions));
 app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.setHeader("X-Frame-Options","DENY");res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");res.setHeader("Permissions-Policy","camera=(self), microphone=(self), display-capture=(self)");next()});
 app.use(express.json({limit:"32kb"}));
-const server=http.createServer(app),io=new Server(server,{cors:{origin:(origin,cb)=>{if(!origin||configuredOrigins.length===0||configuredOrigins.includes("*")||configuredOrigins.includes(origin))return cb(null,true);return cb(null,false)},methods:["GET","POST"]}});
+const server=http.createServer(app),io=new Server(server,{cors:{origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST"]}});
 const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL?{rejectUnauthorized:false}:false});
 const sessions=new Map(),rooms=new Map(),calls=new Map(),callReady=new Map(),rateLimits=new Map(),roomMusic=new Map();
 const SESSION_TTL_MS=7*24*60*60*1000;
@@ -47,7 +54,13 @@ async function initDb(){
    read_at TIMESTAMPTZ
  )`);
  await pool.query("CREATE INDEX IF NOT EXISTS direct_messages_pair_idx ON direct_messages(sender_id,receiver_id,created_at DESC)");
-
+ await pool.query(`CREATE TABLE IF NOT EXISTS app_sessions(
+   token TEXT PRIMARY KEY,
+   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   email VARCHAR(120) NOT NULL,
+   expires_at TIMESTAMPTZ NOT NULL
+ )`);
+ await pool.query("CREATE INDEX IF NOT EXISTS app_sessions_expires_idx ON app_sessions(expires_at)");
 }
 
 function cleanName(value){
@@ -82,32 +95,52 @@ async function getUserByCode(value){
 function pub(u){
   return {id:u.id,name:u.name,email:u.email,code:u.code};
 }
-function token(u){
+async function token(u){
   const t=crypto.randomBytes(32).toString("hex");
-  sessions.set(t,{userId:u.id,email:u.email,expires:Date.now()+SESSION_TTL_MS});
+  const expires=Date.now()+SESSION_TTL_MS;
+  sessions.set(t,{userId:u.id,email:u.email,expires});
+  await pool.query("INSERT INTO app_sessions(token,user_id,email,expires_at) VALUES($1,$2,$3,to_timestamp($4/1000.0))",[t,u.id,u.email,expires]);
   return t;
+}
+async function getSession(t){
+  if(!t)return null;
+  const mem=sessions.get(t);
+  if(mem&&mem.expires>Date.now())return mem;
+  if(mem)sessions.delete(t);
+  const x=await pool.query("SELECT user_id,email,EXTRACT(EPOCH FROM expires_at)*1000 AS expires_ms FROM app_sessions WHERE token=$1 LIMIT 1",[t]);
+  const row=x.rows[0];
+  if(!row)return null;
+  const expires=Number(row.expires_ms);
+  if(!Number.isFinite(expires)||expires<Date.now()){
+    await pool.query("DELETE FROM app_sessions WHERE token=$1",[t]);
+    return null;
+  }
+  const sess={userId:row.user_id,email:row.email,expires};
+  sessions.set(t,sess);
+  return sess;
 }
 async function auth(req,res){
   const raw=String(req.headers.authorization||"");
   const t=raw.startsWith("Bearer ")?raw.slice(7).trim():"";
-  const sess=sessions.get(t);
-  if(!t||!sess||sess.expires<Date.now()){
-    if(t&&sess)sessions.delete(t);
-    res.status(401).json({error:"Sessão inválida ou expirada."});
+  const sess=await getSession(t);
+  if(!sess){
+    res.status(401).json({error:"Sessão inválida ou expirada. Entre novamente."});
     return null;
   }
   const u=await getUserByEmail(sess.email);
   if(!u){
     sessions.delete(t);
+    await pool.query("DELETE FROM app_sessions WHERE token=$1",[t]);
     res.status(401).json({error:"Sessão inválida."});
     return null;
   }
   sess.expires=Date.now()+SESSION_TTL_MS;
+  await pool.query("UPDATE app_sessions SET expires_at=to_timestamp($2/1000.0),email=$3 WHERE token=$1",[t,sess.expires,u.email]);
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.0.1 PostgreSQL"));
-app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.9.1"})}catch(e){r.status(503).json({ok:false,database:false,version:"1.9.1"})}});
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.0.3 PostgreSQL + música"));
+app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.0.3"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.0.3"})}});
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
 // Credentials stay on the server. Configure AUDIUS_API_KEY and/or
@@ -168,7 +201,7 @@ app.post("/api/register",guard,async(q,r)=>{
     const salt=crypto.randomBytes(16).toString("hex"),h=hash(password,salt);
     const x=await pool.query("INSERT INTO users(name,email,code,salt,password_hash) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,code",[name,email,c,salt,h]);
     const u=x.rows[0];
-    r.json({user:pub(u),token:token(u),message:"Conta criada com sucesso."});
+    r.json({user:pub(u),token:await token(u),message:"Conta criada com sucesso."});
   }catch(e){
     console.error(e);
     r.status(500).json({error:e.message||"Não foi possível criar a conta."});
@@ -185,7 +218,7 @@ app.post("/api/login",guard,async(q,r)=>{
     // Treat malformed/legacy hashes as a normal invalid-password result.
     if(expected.length!==stored.length || !crypto.timingSafeEqual(expected,stored))
       return r.status(401).json({error:"E-mail ou senha incorretos."});
-    r.json({user:pub(u),token:token(u),message:"Login realizado com sucesso."});
+    r.json({user:pub(u),token:await token(u),message:"Login realizado com sucesso."});
   }catch(e){
     console.error(e);
     r.status(500).json({error:"Erro ao entrar."});
@@ -238,8 +271,16 @@ app.post("/api/friends/remove",async(q,r)=>{try{const u=await auth(q,r);if(!u)re
 function userList(room){const x=rooms.get(room);return x?[...x.values()].map(v=>({id:v.id,name:v.name,code:v.code,host:v.id===calls.get(room)})):[]}
 const broadcast=room=>io.to(room).emit("room-users",userList(room)),valid=(s,id)=>!!rooms.get(s.data.room)?.has(id),ready=room=>(callReady.has(room)||callReady.set(room,new Set()),callReady.get(room));
 function cleanReady(room,id){const s=callReady.get(room);if(!s)return;s.delete(id);if(!s.size)callReady.delete(room)}
-io.use(async(s,n)=>{try{const sess=sessions.get(s.handshake.auth?.token);if(!sess||sess.expires<Date.now()){if(sess)sessions.delete(s.handshake.auth?.token);return n(new Error("Sessão expirada"));}
-const u=await getUserByEmail(sess.email);if(!u)return n(new Error("Sessão inválida"));s.data.user=u;n()}catch(e){n(new Error("Falha na autenticação"))}});
+io.use(async(s,n)=>{try{
+ const t=String(s.handshake.auth?.token||"").trim();
+ const sess=await getSession(t);
+ if(!sess)return n(new Error("Sessão expirada"));
+ const u=await getUserByEmail(sess.email);
+ if(!u)return n(new Error("Sessão inválida"));
+ sess.expires=Date.now()+SESSION_TTL_MS;
+ await pool.query("UPDATE app_sessions SET expires_at=to_timestamp($2/1000.0) WHERE token=$1",[t,sess.expires]);
+ s.data.user=u;n();
+}catch(e){console.error("socket-auth",e);n(new Error("Falha na autenticação"))}});
 io.on("connection",s=>{
  s.on("client-ping",t=>s.emit("client-pong",t));
  s.on("join",({room})=>{const u=s.data.user;if(!u)return;s.data.room=String(room||"geral").replace(/[^a-zA-Z0-9_-]/g,"").slice(0,32)||"geral";s.data.name=u.name;s.data.code=u.code;const rm=s.data.room;if(!rooms.has(rm))rooms.set(rm,new Map());rooms.get(rm).set(s.id,{id:s.id,name:u.name,code:u.code});s.join(rm);s.emit("room-users",userList(rm));s.to(rm).emit("user-joined",{id:s.id,name:u.name,code:u.code});if(calls.has(rm)){const h=calls.get(rm);s.emit("call-host",h);s.emit("call-state",{active:true,host:h,ready:[...ready(rm)]})}else s.emit("call-state",{active:false,host:null,ready:[]});if(roomMusic.has(rm))s.emit("music-state",musicStateFor(rm));});
@@ -264,5 +305,5 @@ io.on("connection",s=>{
  s.on("signal",({to,data})=>{if(!to||!valid(s,to))return;const set=callReady.get(s.data.room);if(set?.has(s.id)&&set.has(to))io.to(to).emit("signal",{from:s.id,data})});
  s.on("disconnect",()=>{const room=s.data.room;if(!room)return;const rm=rooms.get(room);if(!rm)return;const was=calls.get(room)===s.id;const musicWas=roomMusic.get(room)?.hostId===s.id;cleanReady(room,s.id);rm.delete(s.id);if(musicWas){roomMusic.delete(room);io.to(room).emit("music-stop")}if(was){const next=[...rm.values()][0];if(next){calls.set(room,next.id);io.to(room).emit("call-host",next.id);io.to(room).emit("call-state",{active:true,host:next.id,ready:[...ready(room)]})}else{calls.delete(room);callReady.delete(room);io.to(room).emit("call-ended")}}s.to(room).emit("user-left",{id:s.id,name:s.data.name});s.to(room).emit("call-participant-left",{id:s.id});broadcast(room);if(!rm.size){rooms.delete(room);calls.delete(room);callReady.delete(room)}})
 });
-setInterval(()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k)},30*60*1000);
-initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.0.2 server ativo com PostgreSQL + mensagens diretas + music bot + fila"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
+initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.0.3 FIX server ativo com PostgreSQL + mensagens diretas + music bot + fila"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
