@@ -146,8 +146,8 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.1.0 PostgreSQL + música"));
-app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.1.0"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.1.0"})}});
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.2.0 PostgreSQL + música"));
+app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.2.0"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.2.0"})}});
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
 // Credentials stay on the server. Configure AUDIUS_API_KEY and/or
@@ -314,6 +314,27 @@ io.on("connection",s=>{
  s.on("call-ready",({room})=>{if(room!==s.data.room||!calls.has(room))return;ready(room).add(s.id);const h=calls.get(room);s.emit("call-host",h);s.emit("call-ready-users",[...ready(room)].filter(id=>id!==s.id&&valid(s,id)));if(h!==s.id)io.to(h).emit("call-participant-ready",{id:s.id,name:s.data.name})});
  s.on("call-ready-request",({room})=>{if(room===s.data.room&&calls.get(room)===s.id)s.emit("call-ready-users",[...ready(room)].filter(id=>id!==s.id&&valid(s,id)))});
  s.on("call-leave",({room})=>{if(room===s.data.room){cleanReady(room,s.id);s.to(room).emit("call-participant-left",{id:s.id})}});
+ function leaveRoom(s,room,{keepSocketRoom}={}){
+   const rm=rooms.get(room);if(!rm)return;
+   const was=calls.get(room)===s.id;const musicWas=roomMusic.get(room)?.hostId===s.id;
+   cleanReady(room,s.id);rm.delete(s.id);
+   if(musicWas){roomMusic.delete(room);io.to(room).emit("music-stop")}
+   if(was){
+     const next=[...rm.values()][0];
+     if(next){calls.set(room,next.id);io.to(room).emit("call-host",next.id);io.to(room).emit("call-state",{active:true,host:next.id,ready:[...ready(room)]})}
+     else{calls.delete(room);callReady.delete(room);io.to(room).emit("call-ended")}
+   }
+   s.to(room).emit("user-left",{id:s.id,name:s.data.name});
+   s.to(room).emit("call-participant-left",{id:s.id});
+   if(!keepSocketRoom)s.leave(room);
+   broadcast(room);
+   if(!rm.size){rooms.delete(room);calls.delete(room);callReady.delete(room)}
+ }
+ s.on("leave-room",({room})=>{
+   if(!room||room!==s.data.room)return;
+   leaveRoom(s,room);
+   s.data.room=null;
+ });
  s.on("host-mute",({to,name,room,muted})=>{if(room!==s.data.room||calls.get(room)!==s.id||!valid(s,to))return;io.to(to).emit("participant-muted",{id:to,name,muted});s.to(room).emit("system",s.data.name+(muted?" silenciou ":" liberou o microfone de ")+name+".")});
  s.on("host-kick",({to,name,room})=>{if(room!==s.data.room||calls.get(room)!==s.id||!valid(s,to))return;cleanReady(room,to);io.to(to).emit("call-removed");io.to(room).emit("call-participant-left",{id:to});io.to(room).emit("system",s.data.name+" removeu "+name+" da call.")});
  s.on("call-end",({room})=>{if(room!==s.data.room||calls.get(room)!==s.id)return;calls.delete(room);callReady.delete(room);roomMusic.delete(room);io.to(room).emit("call-ended");io.to(room).emit("call-state",{active:false,host:null,ready:[]});io.to(room).emit("music-stop");io.to(room).emit("system",s.data.name+" encerrou a call.");broadcast(room)});
@@ -349,7 +370,7 @@ io.on("connection",s=>{
    const c=String(toCode||"").trim().toUpperCase();if(!c)return;
    notifyUser(c,"call-invite-declined",{room:String(room||"").trim().toUpperCase(),byName:me.name});
  });
- s.on("disconnect",()=>{const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;const rm=rooms.get(room);if(!rm)return;const was=calls.get(room)===s.id;const musicWas=roomMusic.get(room)?.hostId===s.id;cleanReady(room,s.id);rm.delete(s.id);if(musicWas){roomMusic.delete(room);io.to(room).emit("music-stop")}if(was){const next=[...rm.values()][0];if(next){calls.set(room,next.id);io.to(room).emit("call-host",next.id);io.to(room).emit("call-state",{active:true,host:next.id,ready:[...ready(room)]})}else{calls.delete(room);callReady.delete(room);io.to(room).emit("call-ended")}}s.to(room).emit("user-left",{id:s.id,name:s.data.name});s.to(room).emit("call-participant-left",{id:s.id});broadcast(room);if(!rm.size){rooms.delete(room);calls.delete(room);callReady.delete(room)}})
+ s.on("disconnect",()=>{const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
-initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.1.0 server ativo com PostgreSQL + mensagens diretas + music bot + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.2.0 server ativo com PostgreSQL + mensagens diretas + music bot + convites de call + leave-room"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
