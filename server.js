@@ -1,201 +1,42 @@
-
-const express=require("express");
-const http=require("http");
-const cors=require("cors");
-const {Server}=require("socket.io");
-
-const app=express();
-app.use(cors({origin:"*"}));
-app.get("/",(_,res)=>res.send("Conversa Live signaling server OK"));
-
-const server=http.createServer(app);
-const io=new Server(server,{cors:{origin:"*",methods:["GET","POST"]}});
-
-const rooms=new Map();
-const calls=new Map();
-const callMutes=new Map();
-const callReady=new Map();
-
-function roomUsers(room){
-  const r=rooms.get(room);
-  return r?[...r.values()].map(x=>({
-    id:x.id,name:x.name,host:x.id===calls.get(room)
-  })):[];
-}
-function broadcastUsers(room){io.to(room).emit("room-users",roomUsers(room));}
-function validMember(socket,id){
-  const room=socket.data.room,r=rooms.get(room);
-  return !!r&&r.has(id);
-}
-function readySet(room){
-  if(!callReady.has(room))callReady.set(room,new Set());
-  return callReady.get(room);
-}
-function cleanupReady(room,id){
-  const s=callReady.get(room);
-  if(!s)return;
-  s.delete(id);
-  if(!s.size)callReady.delete(room);
-}
-
-io.on("connection",socket=>{
-  socket.on("join",({room,name})=>{
-    room=String(room||"geral").replace(/[^a-zA-Z0-9_-]/g,"").slice(0,32)||"geral";
-    name=String(name||"Visitante").slice(0,24);
-
-    socket.data.room=room;
-    socket.data.name=name;
-
-    if(!rooms.has(room))rooms.set(room,new Map());
-    const r=rooms.get(room);
-    r.set(socket.id,{id:socket.id,name});
-
-    socket.join(room);
-    socket.emit("room-users",roomUsers(room));
-    socket.to(room).emit("user-joined",{id:socket.id,name});
-
-    if(calls.has(room)){
-      const host=calls.get(room);
-      socket.emit("call-host",host);
-      socket.emit("call-state",{active:true,host,ready:[...readySet(room)]});
-    }else{
-      socket.emit("call-state",{active:false,host:null,ready:[]});
-    }
-  });
-
-  socket.on("chat",({room,text})=>{
-    if(room!==socket.data.room)return;
-    const clean=String(text||"").trim().slice(0,1000);
-    if(!clean)return;
-    io.to(room).emit("chat",{
-      name:socket.data.name,text:clean,
-      time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})
-    });
-  });
-
-  socket.on("call-start",({room})=>{
-    if(room!==socket.data.room)return;
-    if(!calls.has(room)){
-      calls.set(room,socket.id);
-      readySet(room).add(socket.id);
-      io.to(room).emit("call-host",socket.id);
-      io.to(room).emit("system",socket.data.name+" criou uma call.");
-      broadcastUsers(room);
-    }
-    // Sempre devolve o host atual ao solicitante. Isso é importante quando
-    // alguém entra numa call existente antes de receber o evento call-host.
-    socket.emit("call-host",calls.get(room));
-    socket.emit("call-state",{active:true,host:calls.get(room),ready:[...readySet(room)]});
-  });
-
-  socket.on("call-ready",({room})=>{
-    if(room!==socket.data.room||!calls.has(room))return;
-    const set=readySet(room);
-    set.add(socket.id);
-    const host=calls.get(room);
-    socket.emit("call-host",host);
-
-    const others=[...set].filter(id=>id!==socket.id&&validMember(socket,id));
-    socket.emit("call-ready-users",others);
-
-    if(host&&host!==socket.id){
-      io.to(host).emit("call-participant-ready",{
-        id:socket.id,name:socket.data.name
-      });
-    }
-  });
-
-  socket.on("call-ready-request",({room})=>{
-    if(room!==socket.data.room||calls.get(room)!==socket.id)return;
-    const ids=[...readySet(room)].filter(id=>id!==socket.id&&validMember(socket,id));
-    socket.emit("call-ready-users",ids);
-  });
-
-  socket.on("call-leave",({room})=>{
-    if(room!==socket.data.room)return;
-    cleanupReady(room,socket.id);
-    socket.to(room).emit("call-participant-left",{id:socket.id});
-  });
-
-  socket.on("host-mute",({to,name,room,muted})=>{
-    if(room!==socket.data.room||calls.get(room)!==socket.id||!validMember(socket,to))return;
-    const key=room+":"+to;
-    if(muted)callMutes.set(key,true);else callMutes.delete(key);
-    io.to(to).emit("participant-muted",{id:to,name,muted});
-    socket.to(room).emit("system",socket.data.name+(muted?" silenciou ":" liberou o microfone de ")+name+".");
-  });
-
-  socket.on("host-kick",({to,name,room})=>{
-    if(room!==socket.data.room||calls.get(room)!==socket.id||!validMember(socket,to))return;
-    cleanupReady(room,to);
-    io.to(to).emit("call-removed");
-    io.to(room).emit("system",socket.data.name+" removeu "+name+" da call.");
-    // Remove apenas da call: a pessoa continua no chat.
-    io.to(room).emit("call-participant-left",{id:to});
-  });
-
-  socket.on("call-end",({room})=>{
-    if(room!==socket.data.room||calls.get(room)!==socket.id)return;
-    calls.delete(room);
-    callReady.delete(room);
-    for(const k of callMutes.keys())if(k.startsWith(room+":"))callMutes.delete(k);
-    io.to(room).emit("call-ended");
-    io.to(room).emit("call-state",{active:false,host:null,ready:[]});
-    io.to(room).emit("system",socket.data.name+" encerrou a call.");
-    broadcastUsers(room);
-  });
-
-  socket.on("signal",({to,data})=>{
-    if(!to||roomOf(to)!==socket.data.room)return;
-    const ready=callReady.get(socket.data.room);
-    if(!ready?.has(socket.id)||!ready.has(to))return;
-    io.to(to).emit("signal",{from:socket.id,data});
-  });
-
-  function roomOf(id){
-    const s=io.sockets.sockets.get(id);
-    return s?.data?.room;
-  }
-
-  socket.on("disconnect",()=>{
-    const room=socket.data.room;
-    if(!room)return;
-    const r=rooms.get(room);
-    if(!r)return;
-
-    const wasHost=calls.get(room)===socket.id;
-    cleanupReady(room,socket.id);
-    r.delete(socket.id);
-
-    if(wasHost){
-      calls.delete(room);
-      const next=[...r.values()][0];
-      if(next){
-        calls.set(room,next.id);
-        // O novo criador só fica pronto se já estiver na call.
-        // Como o servidor não conhece a interface local, mantemos o estado
-        // pronto apenas se o participante já estava marcado como ready.
-        const nextWasReady=callReady.get(room)?.has(next.id);
-        if(nextWasReady) readySet(room).add(next.id);
-        io.to(room).emit("call-host",next.id);
-        io.to(room).emit("call-state",{active:true,host:next.id,ready:[...readySet(room)]});
-      }else{
-        callReady.delete(room);
-        io.to(room).emit("call-ended");
-        io.to(room).emit("call-state",{active:false,host:null,ready:[]});
-      }
-    }
-
-    socket.to(room).emit("user-left",{id:socket.id,name:socket.data.name});
-    socket.to(room).emit("call-participant-left",{id:socket.id});
-    broadcastUsers(room);
-
-    if(!r.size){
-      rooms.delete(room);calls.delete(room);callReady.delete(room);
-      for(const k of callMutes.keys())if(k.startsWith(room+":"))callMutes.delete(k);
-    }
-  });
-});
-
-const PORT=process.env.PORT||3000;
-server.listen(PORT,()=>console.log("Conversa Live server na porta "+PORT));
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
+import pg from 'pg';
+import http from 'http';
+import {Server} from 'socket.io';
+dotenv.config();
+const app=express(),server=http.createServer(app);
+const origins=process.env.CORS_ORIGIN?process.env.CORS_ORIGIN.split(',').map(x=>x.trim()).filter(Boolean):true;
+app.use(cors({origin:origins}));app.use(express.json({limit:'64kb'}));
+const io=new Server(server,{cors:{origin:origins,methods:['GET','POST']}});
+const pool=process.env.DATABASE_URL?new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:{rejectUnauthorized:false}}):null;
+const secret=process.env.JWT_SECRET||'dev-only-secret';
+const internalSecret=process.env.ADMIN_INTERNAL_SECRET||'dev-admin-secret';
+const sessions=new Map(),sockets=new Map(),activeCalls=new Map();
+async function db(q,p=[]){if(!pool)return null;return (await pool.query(q,p)).rows}
+function hashPassword(password,salt){return crypto.scryptSync(password,salt,64).toString('hex')}
+function makeCode(){return 'FC-'+crypto.randomBytes(3).toString('hex').toUpperCase()}
+function token(u){return jwt.sign({sub:String(u.id),email:u.email,name:u.name,code:u.friend_code},secret,{expiresIn:'7d'})}
+function auth(req,res,next){try{const h=req.headers.authorization||'';const t=h.replace(/^Bearer /,'');req.user=jwt.verify(t,secret);next()}catch{res.status(401).json({error:'unauthorized'})}}
+async function userByEmail(email){const r=await db('select id,name,email,friend_code,status,role,password_hash,password_salt from users where lower(email)=lower($1) limit 1',[email]);return r?.[0]}
+async function publicUser(u){return {id:String(u.id),name:u.name,email:u.email,code:u.friend_code,status:u.status,role:u.role||'Usuário'}}
+async function init(){if(!pool)return;await db(`create table if not exists users(id uuid primary key default gen_random_uuid(),name text not null,email text unique not null,friend_code text unique not null,password_hash text not null,password_salt text not null,status text not null default 'active',role text not null default 'Usuário',created_at timestamptz not null default now(),last_seen timestamptz)`);await db(`create table if not exists friendships(id bigserial primary key,user_id uuid not null references users(id) on delete cascade,friend_id uuid not null references users(id) on delete cascade,created_at timestamptz not null default now(),unique(user_id,friend_id))`);await db(`create table if not exists friend_requests(id bigserial primary key,sender_id uuid not null references users(id) on delete cascade,receiver_id uuid not null references users(id) on delete cascade,status text not null default 'pending',created_at timestamptz not null default now())`);await db(`create table if not exists calls(id text primary key,host_id uuid references users(id),type text not null,status text not null default 'active',started_at timestamptz not null default now(),ended_at timestamptz)`);await db(`create table if not exists streams(id text primary key,host_id uuid references users(id),title text not null,status text not null default 'active',viewers integer not null default 0,started_at timestamptz not null default now(),ended_at timestamptz)`);await db(`create table if not exists reports(id bigserial primary key,reporter_id uuid references users(id),target_id text not null,reason text not null,status text not null default 'pending',created_at timestamptz not null default now())`);await db(`create table if not exists system_settings(key text primary key,value text not null)`);await db(`insert into system_settings(key,value) values('maintenance','false') on conflict(key) do nothing`)}
+app.get('/api/public/status',async(req,res)=>{const r=await db("select value from system_settings where key='maintenance'");res.json({ok:true,maintenance:r?.[0]?.value==='true'})});
+app.get('/api/health',async(req,res)=>res.json({ok:true,database:!!pool,time:new Date().toISOString()}));
+app.post('/api/register',async(req,res)=>{const name=String(req.body?.name||'').trim().slice(0,24),email=String(req.body?.email||'').trim().toLowerCase(),password=String(req.body?.password||'');if(!name||!email||password.length<8)return res.status(400).json({error:'invalid_data'});if((await db("select value from system_settings where key='maintenance'"))?.[0]?.value==='true')return res.status(503).json({error:'maintenance'});if(await userByEmail(email))return res.status(409).json({error:'email_exists'});const salt=crypto.randomBytes(16).toString('hex'),hash=hashPassword(password,salt),code=makeCode();const rows=await db('insert into users(name,email,friend_code,password_hash,password_salt,status) values($1,$2,$3,$4,$5,\'active\') returning id,name,email,friend_code,status,role',[name,email,code,hash,salt]);const u=rows?.[0];if(!u)return res.status(500).json({error:'database_unavailable'});res.json({token:token(u),user:await publicUser(u)});});
+app.post('/api/login',async(req,res)=>{const email=String(req.body?.email||'').trim().toLowerCase(),password=String(req.body?.password||'');const u=await userByEmail(email);if(!u)return res.status(401).json({error:'invalid_credentials'});if(u.status!=='active')return res.status(403).json({error:'suspended'});const ok=crypto.timingSafeEqual(Buffer.from(hashPassword(password,u.password_salt),'hex'),Buffer.from(u.password_hash,'hex'));if(!ok)return res.status(401).json({error:'invalid_credentials'});await db('update users set last_seen=now() where id=$1',[u.id]);res.json({token:token(u),user:await publicUser(u)});});
+app.use('/api',auth);
+app.get('/api/me',async(req,res)=>{const r=await db('select id,name,email,friend_code,status,role from users where id=$1',[req.user.sub]);if(!r?.[0]||r[0].status!=='active')return res.status(403).json({error:'suspended'});res.json({user:await publicUser(r[0])})});
+app.patch('/api/me',async(req,res)=>{const name=String(req.body?.name||'').trim().slice(0,24);if(!name)return res.status(400).json({error:'invalid_name'});const r=await db('update users set name=$1 where id=$2 returning id,name,email,friend_code,status,role',[name,req.user.sub]);res.json({user:await publicUser(r?.[0])})});
+app.get('/api/friends',async(req,res)=>{const r=await db(`select u.id,u.name,u.email,u.friend_code,u.status from friendships f join users u on u.id=case when f.user_id=$1 then f.friend_id else f.user_id end where f.user_id=$1 or f.friend_id=$1 order by u.name`,[req.user.sub]);res.json((r||[]).map(u=>({id:String(u.id),name:u.name,email:u.email,code:u.friend_code,status:u.status})))});
+app.post('/api/friends/request',async(req,res)=>{const code=String(req.body?.code||'').trim().toUpperCase();const target=(await db('select id from users where friend_code=$1',[code]))?.[0];if(!target)return res.status(404).json({error:'not_found'});if(String(target.id)===String(req.user.sub))return res.status(400).json({error:'self'});await db('insert into friend_requests(sender_id,receiver_id) values($1,$2)',[req.user.sub,target.id]);res.json({ok:true})});
+app.post('/api/friends/accept',async(req,res)=>{const id=req.body?.requestId;const r=await db('select sender_id,receiver_id from friend_requests where id=$1 and receiver_id=$2 and status=\'pending\'',[id,req.user.sub]);if(!r?.[0])return res.status(404).json({error:'not_found'});await db('update friend_requests set status=\'accepted\' where id=$1',[id]);await db('insert into friendships(user_id,friend_id) values($1,$2),($2,$1) on conflict do nothing',[r[0].sender_id,r[0].receiver_id]);res.json({ok:true})});
+app.post('/api/streams',async(req,res)=>{const id='live_'+crypto.randomBytes(3).toString('hex').toUpperCase();const title=String(req.body?.title||'FreeChat Stream').slice(0,80);const r=await db('insert into streams(id,host_id,title) values($1,$2,$3) returning *',[id,req.user.sub,title]);res.json(r?.[0]||{id,title,status:'active'})});
+app.post('/api/reports',async(req,res)=>{const target=String(req.body?.targetId||'').slice(0,120),reason=String(req.body?.reason||'').slice(0,200);if(!target||!reason)return res.status(400).json({error:'invalid_report'});const r=await db('insert into reports(reporter_id,target_id,reason) values($1,$2,$3) returning *',[req.user.sub,target,reason]);res.json(r?.[0]||{ok:true})});
+app.post('/api/admin/internal/maintenance',async(req,res)=>{if(req.headers['x-admin-secret']!==internalSecret)return res.status(403).json({error:'forbidden'});const enabled=!!req.body?.enabled;await db("insert into system_settings(key,value) values('maintenance',$1) on conflict(key) do update set value=excluded.value",[String(enabled)]);res.json({ok:true,maintenance:enabled})});
+app.post('/api/admin/internal/action',async(req,res)=>{if(req.headers['x-admin-secret']!==internalSecret)return res.status(403).json({error:'forbidden'});const {type,userId,callId}=req.body||{};if(type==='suspend'){await db("update users set status='suspended' where id=$1",[userId]);const s=sockets.get(String(userId));if(s){io.to(s).emit('admin-action',{type:'suspend'});io.sockets.sockets.get(s)?.disconnect(true)}}if(type==='call-end'){const c=activeCalls.get(String(callId));if(c){io.to(c.room).emit('admin-action',{type:'call-end',callId});activeCalls.delete(String(callId))}await db("update calls set status='ended',ended_at=now() where id=$1",[callId])}res.json({ok:true})});
+io.use((socket,next)=>{try{const t=socket.handshake.auth?.token;socket.user=jwt.verify(t,secret);next()}catch{next(new Error('unauthorized'))}});
+io.on('connection',socket=>{const uid=String(socket.user.sub);sockets.set(uid,socket.id);db('update users set last_seen=now() where id=$1',[uid]);io.emit('presence',[...sockets.keys()]);socket.on('chat-message',m=>{const target=sockets.get(String(m.to));if(target)io.to(target).emit('chat-message',{from:uid,text:String(m.text||'').slice(0,2000)})});socket.on('call-start',async m=>{const id=String(m.callId||('call_'+crypto.randomBytes(3).toString('hex')));activeCalls.set(id,{room:id,host:uid});await db('insert into calls(id,host_id,type) values($1,$2,$3) on conflict do nothing',[id,uid,m.type==='video'?'video':'audio']);socket.join(id);socket.emit('call-ready',{callId:id});});socket.on('call-end',async m=>{const id=String(m.callId||'');const c=activeCalls.get(id);if(c&&c.host===uid){io.to(id).emit('admin-action',{type:'call-end',callId:id});activeCalls.delete(id);await db("update calls set status='ended',ended_at=now() where id=$1",[id])}});socket.on('disconnect',()=>{if(sockets.get(uid)===socket.id)sockets.delete(uid);io.emit('presence',[...sockets.keys()])})});
+await init();server.listen(process.env.PORT||3001,()=>console.log('FreeChat API v2 listening'));
