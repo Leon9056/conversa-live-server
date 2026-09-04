@@ -49,8 +49,65 @@ async function initDb(){
  await pool.query("CREATE INDEX IF NOT EXISTS direct_messages_pair_idx ON direct_messages(sender_id,receiver_id,created_at DESC)");
 
 }
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v1.9 PostgreSQL"));
-app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.9"})}catch(e){r.status(503).json({ok:false,database:false,version:"1.9"})}});
+
+function cleanName(value){
+  return String(value ?? "").replace(/\s+/g," ").trim().slice(0,24);
+}
+function cleanEmail(value){
+  return String(value ?? "").trim().toLowerCase().slice(0,120);
+}
+function code(){
+  const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out="CL-";
+  for(let i=0;i<6;i++)out+=chars[crypto.randomInt(chars.length)];
+  return out;
+}
+function hash(password,salt){
+  return crypto.createHash("sha256").update(String(salt)+String(password)).digest("hex");
+}
+async function getUserByEmail(email){
+  const x=await pool.query(
+    "SELECT id,name,email,code,salt,password_hash,created_at FROM users WHERE email=$1 LIMIT 1",
+    [cleanEmail(email)]
+  );
+  return x.rows[0]||null;
+}
+async function getUserByCode(value){
+  const x=await pool.query(
+    "SELECT id,name,email,code,salt,password_hash,created_at FROM users WHERE code=$1 LIMIT 1",
+    [String(value??"").trim().toUpperCase()]
+  );
+  return x.rows[0]||null;
+}
+function pub(u){
+  return {id:u.id,name:u.name,email:u.email,code:u.code};
+}
+function token(u){
+  const t=crypto.randomBytes(32).toString("hex");
+  sessions.set(t,{userId:u.id,email:u.email,expires:Date.now()+SESSION_TTL_MS});
+  return t;
+}
+async function auth(req,res){
+  const raw=String(req.headers.authorization||"");
+  const t=raw.startsWith("Bearer ")?raw.slice(7).trim():"";
+  const sess=sessions.get(t);
+  if(!t||!sess||sess.expires<Date.now()){
+    if(t&&sess)sessions.delete(t);
+    res.status(401).json({error:"Sessão inválida ou expirada."});
+    return null;
+  }
+  const u=await getUserByEmail(sess.email);
+  if(!u){
+    sessions.delete(t);
+    res.status(401).json({error:"Sessão inválida."});
+    return null;
+  }
+  sess.expires=Date.now()+SESSION_TTL_MS;
+  return u;
+}
+
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v1.9.1 PostgreSQL"));
+app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.9.1"})}catch(e){r.status(503).json({ok:false,database:false,version:"1.9.1"})}});
 
 app.post("/api/register",guard,async(q,r)=>{
   try{
@@ -136,4 +193,4 @@ io.on("connection",s=>{
  s.on("disconnect",()=>{const room=s.data.room;if(!room)return;const rm=rooms.get(room);if(!rm)return;const was=calls.get(room)===s.id;cleanReady(room,s.id);rm.delete(s.id);if(was){const next=[...rm.values()][0];if(next){calls.set(room,next.id);io.to(room).emit("call-host",next.id);io.to(room).emit("call-state",{active:true,host:next.id,ready:[...ready(room)]})}else{calls.delete(room);callReady.delete(room);io.to(room).emit("call-ended")}}s.to(room).emit("user-left",{id:s.id,name:s.data.name});s.to(room).emit("call-participant-left",{id:s.id});broadcast(room);if(!rm.size){rooms.delete(room);calls.delete(room);callReady.delete(room)}})
 });
 setInterval(()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k)},30*60*1000);
-initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v1.8.1 server ativo com PostgreSQL + 2FA por e-mail"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v1.9.1 server ativo com PostgreSQL + mensagens diretas"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
