@@ -1,4 +1,3 @@
-
 const express=require("express"),http=require("http"),cors=require("cors"),crypto=require("crypto"),{Server}=require("socket.io"),{Pool}=require("pg");
 const app=express();
 app.set("trust proxy",1);
@@ -24,37 +23,6 @@ function guard(req,res,next){
   next();
 }
 
-const OTP_TTL_MS=10*60*1000;
-const OTP_RESEND_MS=60*1000;
-const OTP_MAX_ATTEMPTS=5;
-const cleanEmail=v=>String(v||"").trim().toLowerCase().slice(0,120),cleanName=v=>String(v||"").trim().slice(0,24);
-const hash=(p,s)=>crypto.scryptSync(p,s,64).toString("hex");
-function code(){return "CL-"+crypto.randomBytes(3).toString("hex").toUpperCase()}
-function pub(u){return{name:u.name,email:u.email,code:u.code}}
-function token(u){const t=crypto.randomBytes(32).toString("hex");sessions.set(t,{email:u.email,expires:Date.now()+SESSION_TTL_MS});return t}
-async function getUserByEmail(email){const r=await pool.query("SELECT id,name,email,code,salt,password_hash FROM users WHERE email=$1",[email]);return r.rows[0]}
-async function getUserByCode(code){const r=await pool.query("SELECT id,name,email,code FROM users WHERE code=$1",[code]);return r.rows[0]}
-async function auth(req,res){const t=String(req.headers.authorization||"").replace(/^Bearer /,"");const session=sessions.get(t);if(!session)return res.status(401).json({error:"Sessão inválida."});
-if(session.expires<Date.now()){sessions.delete(t);return res.status(401).json({error:"Sessão expirada. Entre novamente."});}
-const u=await getUserByEmail(session.email);if(!u)return res.status(401).json({error:"Sessão inválida."});return u}
-function otpHash(code,salt){return crypto.scryptSync(String(code),salt,32).toString("hex")}
-async function sendOtpEmail(to,name,code){
- const key=process.env.RESEND_API_KEY;
- if(!key)throw new Error("RESEND_API_KEY não configurada no servidor.");
- const from=process.env.EMAIL_FROM||"Conversa Live <onboarding@resend.dev>";
- const html=`<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;padding:28px;background:#101827;color:#fff;border-radius:16px"><h1 style="margin:0 0 10px">Conversa Live</h1><p>Olá, ${String(name).replace(/[<>&]/g,"")}!</p><p>Seu código de verificação em duas etapas é:</p><div style="font-size:34px;letter-spacing:8px;font-weight:700;background:#182338;padding:18px;text-align:center;border-radius:12px">${code}</div><p style="color:#b9c4d6">Ele expira em 10 minutos e só pode ser usado uma vez.</p><p style="color:#8f9bb0;font-size:13px">Se você não tentou entrar no Conversa Live, ignore este e-mail.</p></div>`;
- const resp=await fetch("https://api.resend.com/emails",{method:"POST",headers:{Authorization:`Bearer ${key}`,"Content-Type":"application/json"},body:JSON.stringify({from,to:[to],subject:"Seu código de verificação — Conversa Live",html})});
- if(!resp.ok){const text=await resp.text();throw new Error("Falha ao enviar e-mail: "+text.slice(0,300));}
-}
-async function createOtp(user){
- const recent=await pool.query("SELECT created_at FROM email_2fa_codes WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1",[user.id]);
- if(recent.rowCount && Date.now()-new Date(recent.rows[0].created_at).getTime()<OTP_RESEND_MS)throw new Error("Aguarde 60 segundos antes de solicitar outro código.");
- await pool.query("DELETE FROM email_2fa_codes WHERE user_id=$1 OR expires_at<NOW()",[user.id]);
- const code=String(crypto.randomInt(0,1000000)).padStart(6,"0"),salt=crypto.randomBytes(16).toString("hex"),challenge=crypto.randomBytes(32).toString("hex");
- await pool.query("INSERT INTO email_2fa_codes(challenge_token,user_id,code_salt,code_hash,expires_at,attempts) VALUES($1,$2,$3,$4,NOW()+INTERVAL '10 minutes',0)",[challenge,user.id,salt,otpHash(code,salt)]);
- try{await sendOtpEmail(user.email,user.name,code)}catch(e){await pool.query("DELETE FROM email_2fa_codes WHERE challenge_token=$1",[challenge]);throw e}
- return challenge;
-}
 async function initDb(){
  await pool.query(`CREATE TABLE IF NOT EXISTS users(
  id BIGSERIAL PRIMARY KEY,name VARCHAR(24) NOT NULL,email VARCHAR(120) UNIQUE NOT NULL,code VARCHAR(9) UNIQUE NOT NULL,
@@ -70,18 +38,80 @@ async function initDb(){
  friend_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  created_at TIMESTAMPTZ DEFAULT NOW(),UNIQUE(user_id,friend_id)
  )`);
- await pool.query(`CREATE TABLE IF NOT EXISTS email_2fa_codes(
- id BIGSERIAL PRIMARY KEY,challenge_token VARCHAR(64) UNIQUE NOT NULL,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
- code_salt TEXT NOT NULL,code_hash TEXT NOT NULL,expires_at TIMESTAMPTZ NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,created_at TIMESTAMPTZ DEFAULT NOW()
+ await pool.query(`CREATE TABLE IF NOT EXISTS direct_messages(
+   id BIGSERIAL PRIMARY KEY,
+   sender_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   receiver_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   body TEXT NOT NULL CHECK(length(body) BETWEEN 1 AND 4000),
+   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+   read_at TIMESTAMPTZ
  )`);
- await pool.query("CREATE INDEX IF NOT EXISTS email_2fa_user_idx ON email_2fa_codes(user_id)");
+ await pool.query("CREATE INDEX IF NOT EXISTS direct_messages_pair_idx ON direct_messages(sender_id,receiver_id,created_at DESC)");
+
 }
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v1.8 PostgreSQL + 2FA por e-mail"));
-app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.8.1"})}catch(e){r.status(503).json({ok:false,database:false,version:"1.8.1"})}});
-app.post("/api/2fa/verify",guard,async(q,r)=>{try{const challenge=String(q.body?.challenge||""),code=String(q.body?.code||"").replace(/\D/g,"");if(!/^[0-9]{6}$/.test(code)||challenge.length!==64)return r.status(400).json({error:"Código inválido."});const x=await pool.query(`SELECT c.*,u.id,u.name,u.email,u.code,u.salt,u.password_hash FROM email_2fa_codes c JOIN users u ON u.id=c.user_id WHERE c.challenge_token=$1 AND c.expires_at>NOW()`,[challenge]);if(!x.rowCount)return r.status(400).json({error:"Código expirado ou inválido. Solicite um novo código."});const row=x.rows[0];if(row.attempts>=OTP_MAX_ATTEMPTS){await pool.query("DELETE FROM email_2fa_codes WHERE id=$1",[row.id]);return r.status(429).json({error:"Muitas tentativas. Solicite um novo código."});}const h=otpHash(code,row.code_salt);if(!crypto.timingSafeEqual(Buffer.from(h,"hex"),Buffer.from(row.code_hash,"hex"))){await pool.query("UPDATE email_2fa_codes SET attempts=attempts+1 WHERE id=$1",[row.id]);return r.status(401).json({error:"Código incorreto."});}await pool.query("DELETE FROM email_2fa_codes WHERE id=$1",[row.id]);const u={id:row.id,name:row.name,email:row.email,code:row.code};r.json({user:pub(u),token:token(u)})}catch(e){console.error(e);r.status(500).json({error:"Erro ao verificar o código."})}});
-app.post("/api/2fa/resend",guard,async(q,r)=>{try{const email=cleanEmail(q.body?.email),password=String(q.body?.password||""),u=await getUserByEmail(email);if(!u)return r.status(401).json({error:"E-mail ou senha incorretos."});const h=hash(password,u.salt);if(!crypto.timingSafeEqual(Buffer.from(h,"hex"),Buffer.from(u.password_hash,"hex")))return r.status(401).json({error:"E-mail ou senha incorretos."});const challenge=await createOtp(u);r.json({challenge,message:"Novo código enviado para seu e-mail."})}catch(e){console.error(e);r.status(e.message.includes("Aguarde 60")?429:500).json({error:e.message||"Não foi possível enviar o código."})}});
-app.post("/api/register",guard,async(q,r)=>{try{const name=cleanName(q.body?.name),email=cleanEmail(q.body?.email),password=String(q.body?.password||"");if(name.length<2)return r.status(400).json({error:"O nome precisa ter pelo menos 2 caracteres."});if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return r.status(400).json({error:"E-mail inválido."});if(password.length<6)return r.status(400).json({error:"A senha precisa ter pelo menos 6 caracteres."});if(await getUserByEmail(email))return r.status(409).json({error:"Este e-mail já possui uma conta."});let c;do c=code();while(await getUserByCode(c));const salt=crypto.randomBytes(16).toString("hex"),h=hash(password,salt);const x=await pool.query("INSERT INTO users(name,email,code,salt,password_hash) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,code,salt,password_hash",[name,email,c,salt,h]);const u=x.rows[0];let challenge;try{challenge=await createOtp(u)}catch(e){await pool.query("DELETE FROM users WHERE id=$1",[u.id]);throw e}r.json({user:pub(u),challenge,message:"Conta criada. Enviamos um código de verificação para seu e-mail."})}catch(e){console.error(e);r.status(500).json({error:e.message||"Não foi possível criar a conta."})}});
-app.post("/api/login",guard,async(q,r)=>{try{const email=cleanEmail(q.body?.email),p=String(q.body?.password||""),u=await getUserByEmail(email);if(!u)return r.status(401).json({error:"E-mail ou senha incorretos."});const h=hash(p,u.salt);if(!crypto.timingSafeEqual(Buffer.from(h,"hex"),Buffer.from(u.password_hash,"hex")))return r.status(401).json({error:"E-mail ou senha incorretos."});const challenge=await createOtp(u);r.json({user:pub(u),challenge,message:"Código enviado para seu e-mail."})}catch(e){console.error(e);r.status(e.message.includes("Aguarde 60")?429:500).json({error:e.message||"Erro ao entrar."})}});
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v1.9 PostgreSQL"));
+app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.9"})}catch(e){r.status(503).json({ok:false,database:false,version:"1.9"})}});
+
+app.post("/api/register",guard,async(q,r)=>{
+  try{
+    const name=cleanName(q.body?.name),email=cleanEmail(q.body?.email),password=String(q.body?.password||"");
+    if(name.length<2)return r.status(400).json({error:"O nome precisa ter pelo menos 2 caracteres."});
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return r.status(400).json({error:"E-mail inválido."});
+    if(password.length<6)return r.status(400).json({error:"A senha precisa ter pelo menos 6 caracteres."});
+    if(await getUserByEmail(email))return r.status(409).json({error:"Este e-mail já possui uma conta."});
+    let c;do c=code();while(await getUserByCode(c));
+    const salt=crypto.randomBytes(16).toString("hex"),h=hash(password,salt);
+    const x=await pool.query("INSERT INTO users(name,email,code,salt,password_hash) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,code",[name,email,c,salt,h]);
+    const u=x.rows[0];
+    r.json({user:pub(u),token:token(u),message:"Conta criada com sucesso."});
+  }catch(e){
+    console.error(e);
+    r.status(500).json({error:e.message||"Não foi possível criar a conta."});
+  }
+});
+app.post("/api/login",guard,async(q,r)=>{
+  try{
+    const email=cleanEmail(q.body?.email),p=String(q.body?.password||""),u=await getUserByEmail(email);
+    if(!u)return r.status(401).json({error:"E-mail ou senha incorretos."});
+    const h=hash(p,u.salt);
+    if(!crypto.timingSafeEqual(Buffer.from(h,"hex"),Buffer.from(u.password_hash,"hex")))
+      return r.status(401).json({error:"E-mail ou senha incorretos."});
+    r.json({user:pub(u),token:token(u),message:"Login realizado com sucesso."});
+  }catch(e){
+    console.error(e);
+    r.status(500).json({error:"Erro ao entrar."});
+  }
+});
+
+
+app.get("/api/messages/:code",async(q,r)=>{
+ try{
+  const me=await auth(q,r);if(!me)return;
+  const other=await getUserByCode(String(q.params.code||"").trim().toUpperCase());
+  if(!other)return r.status(404).json({error:"Usuário não encontrado."});
+  if(Number(other.id)===Number(me.id))return r.status(400).json({error:"Você não pode conversar consigo mesmo."});
+  const f=await pool.query("SELECT 1 FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1) LIMIT 1",[me.id,other.id]);
+  if(!f.rowCount)return r.status(403).json({error:"Vocês precisam ser amigos para conversar."});
+  const x=await pool.query(`SELECT id,sender_id,receiver_id,body,created_at,read_at FROM direct_messages
+    WHERE (sender_id=$1 AND receiver_id=$2) OR (sender_id=$2 AND receiver_id=$1)
+    ORDER BY created_at ASC LIMIT 200`,[me.id,other.id]);
+  await pool.query("UPDATE direct_messages SET read_at=NOW() WHERE receiver_id=$1 AND sender_id=$2 AND read_at IS NULL",[me.id,other.id]);
+  r.json({friend:pub(other),messages:x.rows});
+ }catch(e){console.error(e);r.status(500).json({error:"Não foi possível carregar as mensagens."})}
+});
+app.post("/api/messages",async(q,r)=>{
+ try{
+  const me=await auth(q,r);if(!me)return;
+  const code=String(q.body?.code||"").trim().toUpperCase(),body=String(q.body?.body||"").trim();
+  if(!body)return r.status(400).json({error:"Mensagem vazia."});
+  if(body.length>4000)return r.status(400).json({error:"Mensagem muito longa."});
+  const other=await getUserByCode(code);if(!other)return r.status(404).json({error:"Usuário não encontrado."});
+  const f=await pool.query("SELECT 1 FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1) LIMIT 1",[me.id,other.id]);
+  if(!f.rowCount)return r.status(403).json({error:"Vocês precisam ser amigos para conversar."});
+  const x=await pool.query("INSERT INTO direct_messages(sender_id,receiver_id,body) VALUES($1,$2,$3) RETURNING id,sender_id,receiver_id,body,created_at,read_at",[me.id,other.id,body]);
+  r.json({message:x.rows[0]});
+ }catch(e){console.error(e);r.status(500).json({error:"Não foi possível enviar a mensagem."})}
+});
 app.get("/api/friends",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const f=await pool.query(`SELECT u.name,u.email,u.code FROM friendships f JOIN users u ON u.id=f.friend_id WHERE f.user_id=$1 ORDER BY u.name`,[u.id]);const reqs=await pool.query(`SELECT u.name,u.email,u.code FROM friend_requests fr JOIN users u ON u.id=fr.sender_id WHERE fr.receiver_id=$1 AND fr.status='pending' ORDER BY fr.created_at DESC`,[u.id]);r.json({friends:f.rows.map(pub),requests:reqs.rows.map(pub)})}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar amigos."})}});
 app.post("/api/friends/request",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Usuário não encontrado."});if(x.id===u.id)return r.status(400).json({error:"Você não pode adicionar a si mesmo."});const exists=await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[u.id,x.id]);if(exists.rowCount)return r.status(400).json({error:"Vocês já são amigos."});const reverse=await pool.query("SELECT 1 FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(reverse.rowCount)return r.status(400).json({error:"Esse usuário já enviou uma solicitação para você."});await pool.query("INSERT INTO friend_requests(sender_id,receiver_id,status) VALUES($1,$2,'pending') ON CONFLICT(sender_id,receiver_id) DO UPDATE SET status='pending'",[u.id,x.id]);r.json({message:"Solicitação enviada."})}catch(e){console.error(e);r.status(500).json({error:"Erro ao enviar solicitação."})}});
 app.post("/api/friends/accept",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Solicitação não encontrada."});const a=await pool.query("SELECT id FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(!a.rowCount)return r.status(404).json({error:"Solicitação não encontrada."});const client=await pool.connect();try{await client.query("BEGIN");await client.query("UPDATE friend_requests SET status='accepted' WHERE id=$1",[a.rows[0].id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,x.id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[x.id,u.id]);await client.query("COMMIT")}catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao aceitar solicitação."})}});
