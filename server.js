@@ -106,7 +106,7 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v1.9.1 PostgreSQL"));
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v1.9.4 PostgreSQL"));
 app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.9.1"})}catch(e){r.status(503).json({ok:false,database:false,version:"1.9.1"})}});
 
 app.post("/api/register",guard,async(q,r)=>{
@@ -131,7 +131,11 @@ app.post("/api/login",guard,async(q,r)=>{
     const email=cleanEmail(q.body?.email),p=String(q.body?.password||""),u=await getUserByEmail(email);
     if(!u)return r.status(401).json({error:"E-mail ou senha incorretos."});
     const h=hash(p,u.salt);
-    if(!crypto.timingSafeEqual(Buffer.from(h,"hex"),Buffer.from(u.password_hash,"hex")))
+    const expected=Buffer.from(h,"hex");
+    const stored=Buffer.from(String(u.password_hash||""),"hex");
+    // timingSafeEqual throws when buffers have different lengths.
+    // Treat malformed/legacy hashes as a normal invalid-password result.
+    if(expected.length!==stored.length || !crypto.timingSafeEqual(expected,stored))
       return r.status(401).json({error:"E-mail ou senha incorretos."});
     r.json({user:pub(u),token:token(u),message:"Login realizado com sucesso."});
   }catch(e){
@@ -141,6 +145,13 @@ app.post("/api/login",guard,async(q,r)=>{
 });
 
 
+app.get("/api/messages/unread",async(q,r)=>{
+ try{
+  const me=await auth(q,r);if(!me)return;
+  const x=await pool.query(`SELECT u.code,COUNT(*)::int AS count FROM direct_messages m JOIN users u ON u.id=m.sender_id WHERE m.receiver_id=$1 AND m.read_at IS NULL GROUP BY u.code`,[me.id]);
+  const unread={};x.rows.forEach(row=>unread[row.code]=Number(row.count||0));r.json({unread});
+ }catch(e){console.error(e);r.status(500).json({error:"Não foi possível carregar notificações."})}
+});
 app.get("/api/messages/:code",async(q,r)=>{
  try{
   const me=await auth(q,r);if(!me)return;
@@ -166,6 +177,9 @@ app.post("/api/messages",async(q,r)=>{
   const f=await pool.query("SELECT 1 FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1) LIMIT 1",[me.id,other.id]);
   if(!f.rowCount)return r.status(403).json({error:"Vocês precisam ser amigos para conversar."});
   const x=await pool.query("INSERT INTO direct_messages(sender_id,receiver_id,body) VALUES($1,$2,$3) RETURNING id,sender_id,receiver_id,body,created_at,read_at",[me.id,other.id,body]);
+  for(const [sid,ss] of io.sockets.sockets){
+    if(Number(ss.data?.user?.id)===Number(other.id))io.to(sid).emit("dm-new",{code:me.code,message:x.rows[0]});
+  }
   r.json({message:x.rows[0]});
  }catch(e){console.error(e);r.status(500).json({error:"Não foi possível enviar a mensagem."})}
 });
@@ -193,4 +207,4 @@ io.on("connection",s=>{
  s.on("disconnect",()=>{const room=s.data.room;if(!room)return;const rm=rooms.get(room);if(!rm)return;const was=calls.get(room)===s.id;cleanReady(room,s.id);rm.delete(s.id);if(was){const next=[...rm.values()][0];if(next){calls.set(room,next.id);io.to(room).emit("call-host",next.id);io.to(room).emit("call-state",{active:true,host:next.id,ready:[...ready(room)]})}else{calls.delete(room);callReady.delete(room);io.to(room).emit("call-ended")}}s.to(room).emit("user-left",{id:s.id,name:s.data.name});s.to(room).emit("call-participant-left",{id:s.id});broadcast(room);if(!rm.size){rooms.delete(room);calls.delete(room);callReady.delete(room)}})
 });
 setInterval(()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k)},30*60*1000);
-initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v1.9.1 server ativo com PostgreSQL + mensagens diretas"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v1.9.3 server ativo com PostgreSQL + mensagens diretas"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
