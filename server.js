@@ -15,7 +15,7 @@ app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.s
 app.use(express.json({limit:"32kb"}));
 const server=http.createServer(app),io=new Server(server,{cors:{origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST"]}});
 const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL?{rejectUnauthorized:false}:false});
-const sessions=new Map(),rooms=new Map(),calls=new Map(),callReady=new Map(),rateLimits=new Map(),roomMusic=new Map();
+const sessions=new Map(),rooms=new Map(),calls=new Map(),callReady=new Map(),rateLimits=new Map(),roomMusic=new Map(),musicTokens=new Map();
 const SESSION_TTL_MS=7*24*60*60*1000;
 function rateLimit(key,limit,windowMs){
   const now=Date.now(), old=rateLimits.get(key)||[];
@@ -139,8 +139,8 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.0.3 PostgreSQL + música"));
-app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.0.3"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.0.3"})}});
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.0.4 PostgreSQL + música"));
+app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.0.4"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.0.4"})}});
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
 // Credentials stay on the server. Configure AUDIUS_API_KEY and/or
@@ -153,6 +153,7 @@ app.get("/api/music/search",async(q,r)=>{
     if(!rateLimit(requestIp(q)+":music-search",12,60*1000))return r.status(429).json({error:"Muitas buscas de música. Aguarde um pouco."});
     const u=new URL("https://api.audius.co/v1/tracks/search");
     u.searchParams.set("query",term);u.searchParams.set("limit","8");u.searchParams.set("sort_method","relevant");
+    if(process.env.AUDIUS_API_KEY)u.searchParams.set("api_key",process.env.AUDIUS_API_KEY);
     const headers={Accept:"application/json"};
     if(process.env.AUDIUS_BEARER_TOKEN)headers.Authorization="Bearer "+process.env.AUDIUS_BEARER_TOKEN;
     if(process.env.AUDIUS_API_KEY)headers["x-api-key"]=process.env.AUDIUS_API_KEY;
@@ -167,25 +168,36 @@ app.get("/api/music/search",async(q,r)=>{
   }catch(e){console.error("music-search",e);r.status(500).json({error:"Não foi possível buscar músicas agora."})}
 });
 
-app.get("/api/music/stream/:id",async(q,r)=>{
+app.get("/api/music/token",async(q,r)=>{
   try{
     const me=await auth(q,r);if(!me)return;
+    const mt=crypto.randomBytes(24).toString("hex");
+    const expires=Date.now()+15*60*1000;
+    musicTokens.set(mt,{userId:me.id,expires});
+    r.json({token:mt,expires});
+  }catch(e){console.error("music-token",e);r.status(500).json({error:"Não foi possível preparar o áudio."})}
+});
+
+app.get("/api/music/stream/:id",async(q,r)=>{
+  try{
+    const mt=String(q.query?.mt||"").trim();
+    const media=musicTokens.get(mt);
+    if(!media||media.expires<Date.now()){if(mt)musicTokens.delete(mt);return r.status(401).json({error:"Token de áudio inválido ou expirado."});}
     const id=String(q.params.id||"").replace(/[^A-Za-z0-9_-]/g,"").slice(0,80);
     if(!id)return r.status(400).json({error:"Faixa inválida."});
-    const u=`https://api.audius.co/v1/tracks/${encodeURIComponent(id)}/stream`;
+    const u=new URL(`https://api.audius.co/v1/tracks/${encodeURIComponent(id)}/stream`);
+    if(process.env.AUDIUS_API_KEY)u.searchParams.set("api_key",process.env.AUDIUS_API_KEY);
     const headers={Accept:"audio/*,*/*;q=0.8"};
     if(process.env.AUDIUS_BEARER_TOKEN)headers.Authorization="Bearer "+process.env.AUDIUS_BEARER_TOKEN;
     if(process.env.AUDIUS_API_KEY)headers["x-api-key"]=process.env.AUDIUS_API_KEY;
-    const x=await fetch(u,{headers,redirect:"manual"});
-    const location=x.headers.get("location");
-    if(location)return r.redirect(302,location);
+    if(q.headers.range)headers.Range=q.headers.range;
+    const x=await fetch(u,{headers,redirect:"follow"});
     if(!x.ok)return r.status(x.status===401||x.status===403?503:502).json({error:"Não foi possível abrir o áudio desta faixa."});
     const ct=x.headers.get("content-type")||"audio/mpeg";
-    r.setHeader("Content-Type",ct);r.setHeader("Cache-Control","no-store");
-    if(x.body){
-      const {Readable}=require("stream");
-      return Readable.fromWeb(x.body).pipe(r);
-    }
+    r.status(x.status);
+    r.setHeader("Content-Type",ct);r.setHeader("Cache-Control","no-store");r.setHeader("Accept-Ranges","bytes");
+    for(const h of ["content-length","content-range","etag","last-modified"]){const v=x.headers.get(h);if(v)r.setHeader(h,v);}
+    if(x.body){const {Readable}=require("stream");return Readable.fromWeb(x.body).pipe(r);}
     r.status(502).json({error:"Stream de áudio indisponível."});
   }catch(e){console.error("music-stream",e);r.status(500).json({error:"Não foi possível transmitir a música."})}
 });
@@ -294,8 +306,9 @@ io.on("connection",s=>{
  s.on("call-end",({room})=>{if(room!==s.data.room||calls.get(room)!==s.id)return;calls.delete(room);callReady.delete(room);roomMusic.delete(room);io.to(room).emit("call-ended");io.to(room).emit("call-state",{active:false,host:null,ready:[]});io.to(room).emit("music-stop");io.to(room).emit("system",s.data.name+" encerrou a call.");broadcast(room)});
  function musicStateFor(room){const st=roomMusic.get(room);if(!st)return null;const position=st.paused?Number(st.position||0):Math.max(0,Number(st.position||0)+(Date.now()-Number(st.startedAt||Date.now()))/1000);return {...st,position};}
  function cleanMusicTrack(t){const x={id:String(t?.id||"").replace(/[^A-Za-z0-9_-]/g,"").slice(0,80),title:String(t?.title||"Sem título").slice(0,120),artist:String(t?.artist||"Artista desconhecido").slice(0,80),duration:Number(t?.duration||0)};return x.id?x:null;}
+ function musicParticipant(s,room){return room===s.data.room&&calls.has(room)&&ready(room).has(s.id);}
  function musicController(s,room){return room===s.data.room&&calls.get(room)===s.id&&ready(room).has(s.id);}
- s.on("music-play",({room,track})=>{if(!musicController(s,room))return;const clean=cleanMusicTrack(track);if(!clean)return;let st=roomMusic.get(room);if(st){if(st.queue.length>=50){s.emit("music-command-error","A fila está cheia (máximo 50).");return;}st.queue.push(clean);io.to(room).emit("music-state",musicStateFor(room));io.to(room).emit("system",s.data.name+" adicionou 🎵 "+clean.title+" à fila.");return;}st={track:clean,queue:[],hostId:s.id,startedAt:Date.now(),position:0,paused:false,volume:.7};roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));io.to(room).emit("system",s.data.name+" colocou 🎵 "+clean.title+" para tocar.");});
+ s.on("music-play",({room,track})=>{if(!musicParticipant(s,room)){s.emit("music-command-error","Entre em uma call ativa para usar o bot de música.");return;}const clean=cleanMusicTrack(track);if(!clean)return;let st=roomMusic.get(room);if(st){if(st.queue.length>=50){s.emit("music-command-error","A fila está cheia (máximo 50).");return;}st.queue.push(clean);io.to(room).emit("music-state",musicStateFor(room));io.to(room).emit("system",s.data.name+" adicionou 🎵 "+clean.title+" à fila.");return;}st={track:clean,queue:[],hostId:s.id,startedAt:Date.now(),position:0,paused:false,volume:.7};roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));io.to(room).emit("system",s.data.name+" colocou 🎵 "+clean.title+" para tocar.");});
  s.on("music-next",({room})=>{if(!musicController(s,room))return;const st=roomMusic.get(room);if(!st)return;const n=st.queue.shift();if(n){st.track=n;st.startedAt=Date.now();st.position=0;st.paused=false;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));}else{roomMusic.delete(room);io.to(room).emit("music-stop");io.to(room).emit("system","🎵 A fila terminou.");}});
  s.on("music-pause",({room})=>{if(!musicController(s,room))return;const st=roomMusic.get(room);if(!st||st.paused)return;st.position=musicStateFor(room).position;st.paused=true;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));});
  s.on("music-resume",({room})=>{if(!musicController(s,room))return;const st=roomMusic.get(room);if(!st?.paused)return;st.startedAt=Date.now();st.paused=false;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));});
@@ -305,5 +318,5 @@ io.on("connection",s=>{
  s.on("signal",({to,data})=>{if(!to||!valid(s,to))return;const set=callReady.get(s.data.room);if(set?.has(s.id)&&set.has(to))io.to(to).emit("signal",{from:s.id,data})});
  s.on("disconnect",()=>{const room=s.data.room;if(!room)return;const rm=rooms.get(room);if(!rm)return;const was=calls.get(room)===s.id;const musicWas=roomMusic.get(room)?.hostId===s.id;cleanReady(room,s.id);rm.delete(s.id);if(musicWas){roomMusic.delete(room);io.to(room).emit("music-stop")}if(was){const next=[...rm.values()][0];if(next){calls.set(room,next.id);io.to(room).emit("call-host",next.id);io.to(room).emit("call-state",{active:true,host:next.id,ready:[...ready(room)]})}else{calls.delete(room);callReady.delete(room);io.to(room).emit("call-ended")}}s.to(room).emit("user-left",{id:s.id,name:s.data.name});s.to(room).emit("call-participant-left",{id:s.id});broadcast(room);if(!rm.size){rooms.delete(room);calls.delete(room);callReady.delete(room)}})
 });
-setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
-initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.0.3 FIX server ativo com PostgreSQL + mensagens diretas + music bot + fila"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
+initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.0.5 server ativo com PostgreSQL + mensagens diretas + music bot + fila"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
