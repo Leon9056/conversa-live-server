@@ -16,7 +16,7 @@ app.use(express.json({limit:"32kb"}));
 const server=http.createServer(app),io=new Server(server,{cors:{origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST"]}});
 const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL?{rejectUnauthorized:false}:false});
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024},fileFilter:(req,file,cb)=>{const ok=/^(image\/(jpeg|png|webp|gif)|video\/(mp4|webm|quicktime|ogg))$/i.test(file.mimetype);cb(ok?null:new Error("Formato não suportado. Use JPG, PNG, WEBP ou vídeo MP4/WebM."),ok)}});
-const sessions=new Map(),rooms=new Map(),calls=new Map(),callReady=new Map(),rateLimits=new Map(),roomMusic=new Map(),musicTokens=new Map();
+const sessions=new Map(),rooms=new Map(),calls=new Map(),callReady=new Map(),pendingSignals=new Map(),rateLimits=new Map(),roomMusic=new Map(),musicTokens=new Map();
 const onlineByCode=new Map(); // code -> Set(socketId), presence independent of any room
 function notifyUser(code,event,payload){
   const set=onlineByCode.get(code);
@@ -472,9 +472,23 @@ io.on("connection",s=>{
  s.on("join",({room})=>{const u=s.data.user;if(!u)return;s.data.room=String(room||"geral").replace(/[^a-zA-Z0-9_-]/g,"").slice(0,32)||"geral";s.data.name=u.name;s.data.code=u.code;const rm=s.data.room;if(!rooms.has(rm))rooms.set(rm,new Map());rooms.get(rm).set(s.id,{id:s.id,name:u.name,code:u.code});s.join(rm);s.emit("room-users",userList(rm));s.to(rm).emit("user-joined",{id:s.id,name:u.name,code:u.code});if(calls.has(rm)){const h=calls.get(rm);s.emit("call-host",h);s.emit("call-state",{active:true,host:h,ready:[...ready(rm)]})}else s.emit("call-state",{active:false,host:null,ready:[]});if(roomMusic.has(rm))s.emit("music-state",musicStateFor(rm));});
  s.on("chat",({room,text})=>{if(room!==s.data.room)return;const t=String(text||"").trim().slice(0,1000);if(t)io.to(room).emit("chat",{name:s.data.name,text:t,time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})})});
  s.on("call-start",({room},ack)=>{if(room!==s.data.room){if(typeof ack==="function")ack({ok:false,error:"Sala inválida"});return;}if(!calls.has(room)){calls.set(room,s.id);ready(room).add(s.id);io.to(room).emit("call-host",s.id);io.to(room).emit("system",s.data.name+" criou uma call.");broadcast(room)}const host=calls.get(room);s.emit("call-host",host);s.emit("call-state",{active:true,host,ready:[...ready(room)]});if(typeof ack==="function")ack({ok:true,host,ready:[...ready(room)]});});
- s.on("call-ready",({room})=>{if(room!==s.data.room||!calls.has(room))return;ready(room).add(s.id);const h=calls.get(room);s.emit("call-host",h);s.emit("call-ready-users",[...ready(room)].filter(id=>id!==s.id&&valid(s,id)));if(h!==s.id)io.to(h).emit("call-participant-ready",{id:s.id,name:s.data.name})});
+ s.on("call-ready",({room})=>{
+   if(room!==s.data.room||!calls.has(room))return;
+   ready(room).add(s.id);
+   const h=calls.get(room);
+   s.emit("call-host",h);
+   s.emit("call-ready-users",[...ready(room)].filter(id=>id!==s.id&&valid(s,id)));
+   // Flush any signaling messages that arrived a fraction before this socket
+   // was marked ready (common during fast reconnects).
+   const queued=pendingSignals.get(s.id)||[];
+   pendingSignals.delete(s.id);
+   for(const q of queued){
+     if(q?.room===room&&valid(s,q.from))io.to(s.id).emit("signal",{from:q.from,data:q.data});
+   }
+   if(h!==s.id)io.to(h).emit("call-participant-ready",{id:s.id,name:s.data.name});
+ });
  s.on("call-ready-request",({room})=>{if(room===s.data.room&&calls.get(room)===s.id)s.emit("call-ready-users",[...ready(room)].filter(id=>id!==s.id&&valid(s,id)))});
- s.on("call-leave",({room})=>{if(room===s.data.room){cleanReady(room,s.id);s.to(room).emit("call-participant-left",{id:s.id})}});
+ s.on("call-leave",({room})=>{if(room===s.data.room){cleanReady(room,s.id);pendingSignals.delete(s.id);s.to(room).emit("call-participant-left",{id:s.id})}});
  function leaveRoom(s,room,{keepSocketRoom}={}){
    const rm=rooms.get(room);if(!rm)return;
    const was=calls.get(room)===s.id;const musicWas=roomMusic.get(room)?.hostId===s.id;
@@ -510,7 +524,20 @@ io.on("connection",s=>{
  s.on("music-volume",({room,volume})=>{if(!musicController(s,room))return;const st=roomMusic.get(room);if(!st)return;st.volume=Math.max(0,Math.min(1,Number(volume)||0));roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));});
  s.on("music-queue",({room})=>{if(room!==s.data.room)return;const q=roomMusic.get(room)?.queue||[];s.emit("system",q.length?"🎵 Fila ("+q.length+"):\n"+q.slice(0,15).map((x,i)=>(i+1)+". "+x.title+" — "+x.artist).join("\n"):"🎵 A fila está vazia.");});
  s.on("music-stop",({room})=>{if(!musicController(s,room))return;roomMusic.delete(room);io.to(room).emit("music-stop");io.to(room).emit("system",s.data.name+" parou a música e limpou a fila.");});
- s.on("signal",({to,data})=>{const rm=s.data.room;if(!rm||!to||!valid(s,to)||!calls.has(rm))return;const target=io.sockets.sockets.get(to);if(!target||target.data?.room!==rm)return;io.to(to).emit("signal",{from:s.id,data})});
+ s.on("signal",({to,data})=>{
+   const rm=s.data.room;
+   if(!rm||!to||!data||!valid(s,to)||!calls.has(rm))return;
+   const target=io.sockets.sockets.get(to);
+   if(!target||target.data?.room!==rm)return;
+   if(!ready(rm).has(to)){
+     const q=pendingSignals.get(to)||[];
+     q.push({room:rm,from:s.id,data});
+     if(q.length>100)q.shift();
+     pendingSignals.set(to,q);
+     return;
+   }
+   io.to(to).emit("signal",{from:s.id,data});
+ });
  s.on("call-invite",async({code,room},ack)=>{
    try{
      const me=s.data.user;
@@ -531,7 +558,10 @@ io.on("connection",s=>{
    const c=String(toCode||"").trim().toUpperCase();if(!c)return;
    notifyUser(c,"call-invite-declined",{room:String(room||"").trim().toUpperCase(),byName:me.name});
  });
- s.on("disconnect",()=>{const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
+ s.on("disconnect",()=>{
+   pendingSignals.delete(s.id);
+   for(const [target,q] of pendingSignals){const filtered=q.filter(x=>x.from!==s.id);if(filtered.length)pendingSignals.set(target,filtered);else pendingSignals.delete(target);}
+const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
 initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.5.3 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
