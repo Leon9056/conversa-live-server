@@ -11,12 +11,15 @@ function allowOrigin(origin){
 }
 const corsOptions={origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST","OPTIONS"],credentials:false};
 app.use(cors(corsOptions));
-app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.setHeader("X-Frame-Options","DENY");res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");res.setHeader("Permissions-Policy","camera=(self), microphone=(self), display-capture=(self)");next()});
+app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.setHeader("X-Frame-Options","DENY");res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");res.setHeader("Permissions-Policy","camera=(self), microphone=(self), display-capture=(self)");res.setHeader("Cross-Origin-Opener-Policy","same-origin");res.setHeader("Cross-Origin-Resource-Policy","cross-origin");res.setHeader("Content-Security-Policy","default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https: wss:; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data: https:; form-action 'self'");if(req.secure||req.headers["x-forwarded-proto"]==="https")res.setHeader("Strict-Transport-Security","max-age=31536000; includeSubDomains");next()});
 app.use(express.json({limit:"32kb"}));
 const server=http.createServer(app),io=new Server(server,{cors:{origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST"]}});
 const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL?{rejectUnauthorized:false}:false});
-const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024},fileFilter:(req,file,cb)=>{const ok=/^(image\/(jpeg|png|webp|gif)|video\/(mp4|webm|quicktime|ogg))$/i.test(file.mimetype);cb(ok?null:new Error("Formato não suportado. Use JPG, PNG, WEBP ou vídeo MP4/WebM."),ok)}});
+const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024},fileFilter:(req,file,cb)=>{const mime=/^(image\/(jpeg|png|webp|gif)|video\/(mp4|webm|quicktime|ogg))$/i.test(file.mimetype);const name=String(file.originalname||"").normalize("NFKC");const ext=(name.match(/\.([A-Za-z0-9]{1,8})$/)||[])[1]?.toLowerCase();const allowed=(file.mimetype.startsWith("image/")?{jpeg:"image/jpeg",jpg:"image/jpeg",png:"image/png",webp:"image/webp",gif:"image/gif"}:{mp4:"video/mp4",webm:"video/webm",mov:"video/quicktime",ogg:"video/ogg",oga:"video/ogg"});const ok=!!ext&&mime&&allowed[ext]===file.mimetype.toLowerCase()&&!/\.(php|phtml|js|html|svg|exe|bat|cmd|sh)(\.|$)/i.test(name);cb(ok?null:new Error("Arquivo não permitido. Use uma imagem JPG/PNG/WEBP/GIF ou vídeo MP4/WebM/MOV/OGG."),ok)}});
 const sessions=new Map(),rooms=new Map(),calls=new Map(),callReady=new Map(),pendingSignals=new Map(),rateLimits=new Map(),roomMusic=new Map(),musicTokens=new Map();
+function validFileSignature(file){try{const b=file?.buffer;if(!b||!b.length)return false;const mime=String(file.mimetype||"").toLowerCase();if(mime==="image/jpeg")return b[0]===0xff&&b[1]===0xd8&&b[2]===0xff;if(mime==="image/png")return b.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]));if(mime==="image/gif")return b.subarray(0,6).toString()==="GIF87a"||b.subarray(0,6).toString()==="GIF89a";if(mime==="image/webp")return b.subarray(0,4).toString()==="RIFF"&&b.subarray(8,12).toString()==="WEBP";if(mime==="video/ogg")return b.subarray(0,4).toString()==="OggS";if(mime==="video/webm")return b.subarray(0,4).equals(Buffer.from([0x1a,0x45,0xdf,0xa3]));if(mime==="video/mp4"||mime==="video/quicktime")return b.length>12&&b.subarray(4,8).toString()==="ftyp";return false}catch(e){return false}}
+function safeFilename(name){return String(name||"media").normalize("NFKC").replace(/[^A-Za-z0-9._ -]/g,"_").replace(/\.{2,}/g,".").slice(0,120)||"media";}
+
 const onlineByCode=new Map(); // code -> Set(socketId), presence independent of any room
 function notifyUser(code,event,payload){
   const set=onlineByCode.get(code);
@@ -107,7 +110,17 @@ async function initDb(){
    email VARCHAR(120) NOT NULL,
    expires_at TIMESTAMPTZ NOT NULL
  )`);
+ await pool.query("ALTER TABLE app_sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()");
+ await pool.query("ALTER TABLE app_sessions ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()");
+ await pool.query("ALTER TABLE app_sessions ADD COLUMN IF NOT EXISTS user_agent TEXT");
+ await pool.query("ALTER TABLE app_sessions ADD COLUMN IF NOT EXISTS ip_hash TEXT");
+ await pool.query("CREATE INDEX IF NOT EXISTS app_sessions_user_idx ON app_sessions(user_id,created_at DESC)");
  await pool.query("CREATE INDEX IF NOT EXISTS app_sessions_expires_idx ON app_sessions(expires_at)");
+ await pool.query(`CREATE TABLE IF NOT EXISTS security_events(id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,event_type VARCHAR(48) NOT NULL,ip_hash TEXT,user_agent TEXT,meta JSONB,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+ await pool.query("CREATE INDEX IF NOT EXISTS security_events_user_idx ON security_events(user_id,created_at DESC)");
+ await pool.query(`CREATE TABLE IF NOT EXISTS blocked_users(user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,blocked_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(user_id,blocked_id))`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS reports(id BIGSERIAL PRIMARY KEY,reporter_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,target_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,reason VARCHAR(64) NOT NULL,details VARCHAR(1000),status VARCHAR(16) NOT NULL DEFAULT 'open',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS user_privacy(user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,message_policy VARCHAR(16) NOT NULL DEFAULT 'friends',call_policy VARCHAR(16) NOT NULL DEFAULT 'friends',friend_policy VARCHAR(16) NOT NULL DEFAULT 'everyone')`);
 }
 
 function cleanName(value){
@@ -122,9 +135,25 @@ function code(){
   for(let i=0;i<6;i++)out+=chars[crypto.randomInt(chars.length)];
   return out;
 }
-function hash(password,salt){
-  return crypto.createHash("sha256").update(String(salt)+String(password)).digest("hex");
+const SCRYPT_N=16384, SCRYPT_R=8, SCRYPT_P=1, SCRYPT_KEYLEN=64;
+function legacyHash(password,salt){return crypto.createHash("sha256").update(String(salt)+String(password)).digest("hex");}
+function hashPassword(password){return new Promise((resolve,reject)=>{const salt=crypto.randomBytes(16);crypto.scrypt(String(password),salt, SCRYPT_KEYLEN,{N:SCRYPT_N,r:SCRYPT_R,p:SCRYPT_P,maxmem:32*1024*1024},(err,derived)=>{if(err)return reject(err);resolve(`scrypt$${SCRYPT_N}$${SCRYPT_R}$${SCRYPT_P}$${salt.toString("base64url")}$${derived.toString("base64url")}`)})})}
+function verifyPassword(password,stored,legacySalt=""){
+  const value=String(stored||"");
+  if(value.startsWith("scrypt$")){
+    const parts=value.split("$"); if(parts.length!==6)return Promise.resolve(false);
+    const [,n,r,pp,saltB64,hashB64]=parts;
+    const N=Number(n),R=Number(r),P=Number(pp); if(!N||!R||!P)return Promise.resolve(false);
+    return new Promise(resolve=>crypto.scrypt(String(password),Buffer.from(saltB64,"base64url"),Buffer.from(hashB64,"base64url").length,{N,r:R,p:P,maxmem:64*1024*1024},(err,derived)=>{if(err)return resolve(false);const expected=Buffer.from(hashB64,"base64url");resolve(expected.length===derived.length&&crypto.timingSafeEqual(expected,derived));}));
+  }
+  try{const h=legacyHash(password,legacySalt);const expected=Buffer.from(h,"hex"),actual=Buffer.from(String(stored),"hex");return Promise.resolve(expected.length===actual.length&&crypto.timingSafeEqual(expected,actual));}catch(e){return Promise.resolve(false)}
 }
+function sessionHash(t){return crypto.createHash("sha256").update(String(t)).digest("hex");}
+const failedLogins=new Map();
+function loginAllowed(key){const now=Date.now(),x=failedLogins.get(key)||[];const fresh=x.filter(t=>now-t<15*60*1000);failedLogins.set(key,fresh);return fresh.length<8;}
+function noteFailedLogin(key){const now=Date.now(),x=failedLogins.get(key)||[];x.push(now);failedLogins.set(key,x.filter(t=>now-t<15*60*1000));}
+function clearFailedLogin(key){failedLogins.delete(key);}
+async function securityEvent(userId,type,meta={}){try{await pool.query("INSERT INTO security_events(user_id,event_type,ip_hash,user_agent,meta) VALUES($1,$2,$3,$4,$5)",[userId||null,type,meta.ip?crypto.createHash("sha256").update(String(process.env.SESSION_SECRET||"freechat")+String(meta.ip)).digest("hex"):null,String(meta.ua||"").slice(0,300),JSON.stringify(meta.data||{})])}catch(e){console.error("security-event",e)}}
 async function getUserByEmail(email){
   const x=await pool.query(
     "SELECT id,name,email,code,salt,password_hash,created_at FROM users WHERE email=$1 LIMIT 1",
@@ -142,11 +171,11 @@ async function getUserByCode(value){
 function pub(u){
   return {id:u.id,name:u.name,email:u.email,code:u.code};
 }
-async function token(u){
-  const t=crypto.randomBytes(32).toString("hex");
+async function token(u,meta={}){
+  const t=crypto.randomBytes(32).toString("base64url");
   const expires=Date.now()+SESSION_TTL_MS;
   sessions.set(t,{userId:u.id,email:u.email,expires});
-  await pool.query("INSERT INTO app_sessions(token,user_id,email,expires_at) VALUES($1,$2,$3,to_timestamp($4/1000.0))",[t,u.id,u.email,expires]);
+  await pool.query("INSERT INTO app_sessions(token,user_id,email,expires_at,user_agent,ip_hash) VALUES($1,$2,$3,to_timestamp($4/1000.0),$5,$6)",[sessionHash(t),u.id,u.email,expires,String(meta.ua||"").slice(0,300),meta.ip?crypto.createHash("sha256").update(String(process.env.SESSION_SECRET||"freechat")+String(meta.ip)).digest("hex"):null]);
   return t;
 }
 async function getSession(t){
@@ -154,12 +183,12 @@ async function getSession(t){
   const mem=sessions.get(t);
   if(mem&&mem.expires>Date.now())return mem;
   if(mem)sessions.delete(t);
-  const x=await pool.query("SELECT user_id,email,EXTRACT(EPOCH FROM expires_at)*1000 AS expires_ms FROM app_sessions WHERE token=$1 LIMIT 1",[t]);
+  const x=await pool.query("SELECT user_id,email,EXTRACT(EPOCH FROM expires_at)*1000 AS expires_ms FROM app_sessions WHERE token=$1 LIMIT 1",[sessionHash(t)]);
   const row=x.rows[0];
   if(!row)return null;
   const expires=Number(row.expires_ms);
   if(!Number.isFinite(expires)||expires<Date.now()){
-    await pool.query("DELETE FROM app_sessions WHERE token=$1",[t]);
+    await pool.query("DELETE FROM app_sessions WHERE token=$1",[sessionHash(t)]);
     return null;
   }
   const sess={userId:row.user_id,email:row.email,expires};
@@ -174,19 +203,20 @@ async function auth(req,res){
     res.status(401).json({error:"Sessão inválida ou expirada. Entre novamente."});
     return null;
   }
+  if(req.method!=="GET" && !rateLimit("user-api:"+sess.userId+":"+req.path,60,60*1000)){res.status(429).json({error:"Muitas ações em pouco tempo. Aguarde um momento."});return null;}
   const u=await getUserByEmail(sess.email);
   if(!u){
     sessions.delete(t);
-    await pool.query("DELETE FROM app_sessions WHERE token=$1",[t]);
+    await pool.query("DELETE FROM app_sessions WHERE token=$1",[sessionHash(t)]);
     res.status(401).json({error:"Sessão inválida."});
     return null;
   }
   sess.expires=Date.now()+SESSION_TTL_MS;
-  await pool.query("UPDATE app_sessions SET expires_at=to_timestamp($2/1000.0),email=$3 WHERE token=$1",[t,sess.expires,u.email]);
+  await pool.query("UPDATE app_sessions SET expires_at=to_timestamp($2/1000.0),email=$3,last_seen_at=NOW() WHERE token=$1",[sessionHash(t),sess.expires,u.email]);
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v3.0.0 PostgreSQL + música"));
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v3.0.2 PostgreSQL + música"));
 app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"3.0.0"})}catch(e){r.status(503).json({ok:false,database:false,version:"3.0.0"})}});
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
@@ -235,6 +265,7 @@ app.post("/api/feed/media",(req,res,next)=>{
  if(body.length>1000)return r.status(400).json({error:"A publicação pode ter no máximo 1000 caracteres."});
  if(!q.file)return r.status(400).json({error:"Escolha uma foto ou vídeo."});
  if(q.file.size>20*1024*1024)return r.status(413).json({error:"A mídia precisa ter no máximo 20 MB."});
+ if(!validFileSignature(q.file))return r.status(400).json({error:"O conteúdo do arquivo não corresponde ao formato informado."});
  const isVideo=q.file.mimetype.startsWith("video/");
  if(isVideo && (!Number.isFinite(duration)||duration<=0||duration>60.5))return r.status(400).json({error:"Os vídeos precisam ter até 1 minuto."});
  if(!body && !q.file)return r.status(400).json({error:"Adicione uma legenda ou mídia."});
@@ -242,7 +273,7 @@ app.post("/api/feed/media",(req,res,next)=>{
  const kind=q.file.mimetype.startsWith("image/")?"image":"video";
  const x=await pool.query(`INSERT INTO social_posts(author_id,body,media_type,media_name,media_mime,media_size,media_duration,media_data)
  VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,body,created_at`,[
-   u.id,body||null,kind,String(q.file.originalname||"media").slice(0,180),q.file.mimetype,q.file.size,isVideo?duration:null,q.file.buffer
+   u.id,body||null,kind,safeFilename(q.file.originalname||"media"),q.file.mimetype,q.file.size,isVideo?duration:null,q.file.buffer
  ]);
  r.json({post:{...x.rows[0],author_id:u.id,name:u.name,code:u.code,likes:0,liked:false}});
 }catch(e){console.error("feed-media-upload",e);r.status(500).json({error:"Não foi possível publicar a mídia."})}});
@@ -334,13 +365,14 @@ app.post("/api/register",guard,async(q,r)=>{
     const name=cleanName(q.body?.name),email=cleanEmail(q.body?.email),password=String(q.body?.password||"");
     if(name.length<2)return r.status(400).json({error:"O nome precisa ter pelo menos 2 caracteres."});
     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return r.status(400).json({error:"E-mail inválido."});
-    if(password.length<6)return r.status(400).json({error:"A senha precisa ter pelo menos 6 caracteres."});
+    if(password.length<10||!/[A-Za-z]/.test(password)||!/[0-9]/.test(password))return r.status(400).json({error:"A senha precisa ter pelo menos 10 caracteres e incluir letras e números."});
     if(await getUserByEmail(email))return r.status(409).json({error:"Este e-mail já possui uma conta."});
     let c;do c=code();while(await getUserByCode(c));
-    const salt=crypto.randomBytes(16).toString("hex"),h=hash(password,salt);
+    const salt=crypto.randomBytes(16).toString("hex"),h=await hashPassword(password);
     const x=await pool.query("INSERT INTO users(name,email,code,salt,password_hash) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,code",[name,email,c,salt,h]);
     const u=x.rows[0];
-    r.json({user:pub(u),token:await token(u),message:"Conta criada com sucesso."});
+    await securityEvent(u.id,"ACCOUNT_CREATED",{ip:requestIp(q),ua:q.headers["user-agent"]});
+    r.json({user:pub(u),token:await token(u,{ip:requestIp(q),ua:q.headers["user-agent"]}),message:"Conta criada com sucesso."});
   }catch(e){
     console.error(e);
     r.status(500).json({error:e.message||"Não foi possível criar a conta."});
@@ -348,29 +380,37 @@ app.post("/api/register",guard,async(q,r)=>{
 });
 app.post("/api/login",guard,async(q,r)=>{
   try{
-    const email=cleanEmail(q.body?.email),p=String(q.body?.password||""),u=await getUserByEmail(email);
-    if(!u)return r.status(401).json({error:"E-mail ou senha incorretos."});
-    const h=hash(p,u.salt);
-    const expected=Buffer.from(h,"hex");
-    const stored=Buffer.from(String(u.password_hash||""),"hex");
-    // timingSafeEqual throws when buffers have different lengths.
-    // Treat malformed/legacy hashes as a normal invalid-password result.
-    if(expected.length!==stored.length || !crypto.timingSafeEqual(expected,stored))
-      return r.status(401).json({error:"E-mail ou senha incorretos."});
-    r.json({user:pub(u),token:await token(u),message:"Login realizado com sucesso."});
-  }catch(e){
-    console.error(e);
-    r.status(500).json({error:"Erro ao entrar."});
-  }
+    const email=cleanEmail(q.body?.email),p=String(q.body?.password||""),ip=requestIp(q),key=ip+":"+email;
+    if(!loginAllowed(key))return r.status(429).json({error:"Muitas tentativas de login. Aguarde 15 minutos."});
+    const u=await getUserByEmail(email);
+    if(!u){noteFailedLogin(key);await securityEvent(null,"LOGIN_FAILED",{ip,ua:q.headers["user-agent"],data:{email}});return r.status(401).json({error:"E-mail ou senha incorretos."});}
+    const ok=await verifyPassword(p,u.password_hash,u.salt);
+    if(!ok){noteFailedLogin(key);await securityEvent(u.id,"LOGIN_FAILED",{ip,ua:q.headers["user-agent"]});return r.status(401).json({error:"E-mail ou senha incorretos."});}
+    clearFailedLogin(key);
+    if(!String(u.password_hash).startsWith("scrypt$")){const upgraded=await hashPassword(p);await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2",[upgraded,u.id]);}
+    const t=await token(u,{ip,ua:q.headers["user-agent"]});
+    await securityEvent(u.id,"LOGIN_SUCCESS",{ip,ua:q.headers["user-agent"]});
+    r.json({user:pub(u),token:t,message:"Login realizado com sucesso."});
+  }catch(e){console.error(e);r.status(500).json({error:"Erro ao entrar."});}
 });
+
+app.post("/api/logout",async(q,r)=>{try{const raw=String(q.headers.authorization||"");const t=raw.startsWith("Bearer ")?raw.slice(7).trim():"";if(t){const sess=await getSession(t);if(sess)await securityEvent(sess.userId,"LOGOUT",{ip:requestIp(q),ua:q.headers["user-agent"]});sessions.delete(t);await pool.query("DELETE FROM app_sessions WHERE token=$1",[sessionHash(t)]);}r.json({ok:true})}catch(e){r.json({ok:true})}});
+
+app.get("/api/security/sessions",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const raw=String(q.headers.authorization||"");const current=raw.startsWith("Bearer ")?sessionHash(raw.slice(7).trim()):"";const x=await pool.query("SELECT token,created_at,last_seen_at,user_agent,expires_at FROM app_sessions WHERE user_id=$1 AND expires_at>NOW() ORDER BY last_seen_at DESC",[u.id]);r.json({sessions:x.rows.map(v=>({id:crypto.createHash("sha256").update(v.token).digest("hex").slice(0,12),current:v.token===current,created_at:v.created_at,last_seen_at:v.last_seen_at,expires_at:v.expires_at,user_agent:v.user_agent||"Navegador"}))})}catch(e){r.status(500).json({error:"Não foi possível carregar as sessões."})}});
+app.post("/api/security/revoke",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const id=String(q.body?.id||"");if(!/^[a-f0-9]{12}$/.test(id))return r.status(400).json({error:"Sessão inválida."});const x=await pool.query("SELECT token FROM app_sessions WHERE user_id=$1 AND expires_at>NOW()",[u.id]);const hit=x.rows.find(v=>crypto.createHash("sha256").update(v.token).digest("hex").slice(0,12)===id);if(!hit)return r.status(404).json({error:"Sessão não encontrada."});await pool.query("DELETE FROM app_sessions WHERE token=$1",[hit.token]);await securityEvent(u.id,"SESSION_REVOKED",{ip:requestIp(q),ua:q.headers["user-agent"]});r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível revogar a sessão."})}});
+app.post("/api/security/revoke-all",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const raw=String(q.headers.authorization||"");const current=raw.startsWith("Bearer ")?sessionHash(raw.slice(7).trim()):"";await pool.query("DELETE FROM app_sessions WHERE user_id=$1 AND token<>$2",[u.id,current]);await securityEvent(u.id,"ALL_OTHER_SESSIONS_REVOKED",{ip:requestIp(q),ua:q.headers["user-agent"]});r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível encerrar as outras sessões."})}});
+app.post("/api/security/password",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const current=String(q.body?.currentPassword||""),next=String(q.body?.newPassword||"");if(next.length<10)return r.status(400).json({error:"A nova senha precisa ter pelo menos 10 caracteres."});if(!/[A-Za-z]/.test(next)||!/[0-9]/.test(next))return r.status(400).json({error:"Use letras e números na nova senha."});if(!(await verifyPassword(current,u.password_hash,u.salt)))return r.status(401).json({error:"Senha atual incorreta."});const h=await hashPassword(next);await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2",[h,u.id]);const raw=String(q.headers.authorization||"");const currentToken=raw.startsWith("Bearer ")?sessionHash(raw.slice(7).trim()):"";await pool.query("DELETE FROM app_sessions WHERE user_id=$1 AND token<>$2",[u.id,currentToken]);await securityEvent(u.id,"PASSWORD_CHANGED",{ip:requestIp(q),ua:q.headers["user-agent"]});r.json({ok:true,message:"Senha alterada. As outras sessões foram encerradas."})}catch(e){console.error(e);r.status(500).json({error:"Não foi possível alterar a senha."})}});
+app.get("/api/security/events",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const x=await pool.query("SELECT event_type,created_at,meta FROM security_events WHERE user_id=$1 ORDER BY created_at DESC LIMIT 30",[u.id]);r.json({events:x.rows})}catch(e){r.status(500).json({error:"Não foi possível carregar o histórico de segurança."})}});
+
+
 
 
 async function getFriendForDM(me,code){
  const other=await getUserByCode(String(code||"").trim().toUpperCase());
  if(!other)return {error:"Usuário não encontrado.",status:404};
  if(Number(other.id)===Number(me.id))return {error:"Você não pode conversar consigo mesmo.",status:400};
- const f=await pool.query("SELECT 1 FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1) LIMIT 1",[me.id,other.id]);
- if(!f.rowCount)return {error:"Vocês precisam ser amigos para conversar.",status:403};
+ const privacy=await privacyFor(other.id);
+ if(!(await canContact(other.id,me.id,privacy.message_policy)))return {error:"Este usuário não permite mensagens de você.",status:403};
  return {other};
 }
 const mediaSecret=String(process.env.SESSION_SECRET||process.env.DATABASE_URL||crypto.randomBytes(32).toString("hex"));
@@ -439,13 +479,25 @@ app.post("/api/messages/media",(req,res,next)=>{upload.single("file")(req,res,er
   const {other,error,status}=await getFriendForDM(me,code);if(error)return r.status(status).json({error});
   if(!rateLimit("dm-media:"+me.id,12,60*1000))return r.status(429).json({error:"Muitos arquivos enviados. Aguarde um pouco."});
   const kind=q.file.mimetype.startsWith("image/")?"image":"video";
-  const x=await pool.query(`INSERT INTO direct_messages(sender_id,receiver_id,body,media_type,media_name,media_mime,media_size,media_duration,media_data) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,sender_id,receiver_id,body,created_at,read_at`,[me.id,other.id,caption||null,kind,String(q.file.originalname||"media").slice(0,180),q.file.mimetype,q.file.size,q.file.mimetype.startsWith("video/")?duration:null,q.file.buffer]);
+  const x=await pool.query(`INSERT INTO direct_messages(sender_id,receiver_id,body,media_type,media_name,media_mime,media_size,media_duration,media_data) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,sender_id,receiver_id,body,created_at,read_at`,[me.id,other.id,caption||null,kind,safeFilename(q.file.originalname||"media"),q.file.mimetype,q.file.size,q.file.mimetype.startsWith("video/")?duration:null,q.file.buffer]);
   const row=await pool.query("SELECT CASE WHEN media_data IS NOT NULL THEN id END AS media_id,media_type,media_name,media_mime,media_size,media_duration FROM direct_messages WHERE id=$1",[x.rows[0].id]);
   const message=messagePublic({...x.rows[0],...row.rows[0]},me.id);notifyUser(other.code,"dm-new",{code:me.code,fromName:me.name,message}); await addNotification(other.id,"message","Nova mensagem",me.name+" enviou uma mensagem.",{code:me.code});r.json({message});
  }catch(e){console.error("message-media-upload",e);r.status(500).json({error:"Não foi possível enviar o arquivo."})}
 });
+async function privacyFor(userId){const x=await pool.query("SELECT message_policy,call_policy,friend_policy FROM user_privacy WHERE user_id=$1",[userId]);if(x.rowCount)return x.rows[0];await pool.query("INSERT INTO user_privacy(user_id) VALUES($1) ON CONFLICT DO NOTHING",[userId]);return {message_policy:"friends",call_policy:"friends",friend_policy:"everyone"}}
+async function areFriends(a,b){return (await pool.query("SELECT 1 FROM friendships WHERE (user_id=$1 AND friend_id=$2) LIMIT 1",[a,b])).rowCount>0}
+async function isBlocked(a,b){return (await pool.query("SELECT 1 FROM blocked_users WHERE (user_id=$1 AND blocked_id=$2) OR (user_id=$2 AND blocked_id=$1) LIMIT 1",[a,b])).rowCount>0}
+async function canContact(targetId,meId,policy){if(await isBlocked(targetId,meId))return false;if(policy==="everyone")return true;if(policy==="nobody")return false;return areFriends(targetId,meId)}
+app.get("/api/security/privacy",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;r.json(await privacyFor(u.id))}catch(e){r.status(500).json({error:"Não foi possível carregar a privacidade."})}});
+app.patch("/api/security/privacy",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const allowed=["everyone","friends","nobody"];const m=String(q.body?.message_policy||"friends"),c=String(q.body?.call_policy||"friends"),f=String(q.body?.friend_policy||"everyone");if(!allowed.includes(m)||!allowed.includes(c)||!allowed.includes(f))return r.status(400).json({error:"Configuração de privacidade inválida."});await pool.query("INSERT INTO user_privacy(user_id,message_policy,call_policy,friend_policy) VALUES($1,$2,$3,$4) ON CONFLICT(user_id) DO UPDATE SET message_policy=EXCLUDED.message_policy,call_policy=EXCLUDED.call_policy,friend_policy=EXCLUDED.friend_policy",[u.id,m,c,f]);await securityEvent(u.id,"PRIVACY_UPDATED",{ip:requestIp(q),ua:q.headers["user-agent"]});r.json({message_policy:m,call_policy:c,friend_policy:f})}catch(e){r.status(500).json({error:"Não foi possível salvar a privacidade."})}});
+
+app.get("/api/security/blocked",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const x=await pool.query("SELECT u.name,u.code FROM blocked_users b JOIN users u ON u.id=b.blocked_id WHERE b.user_id=$1 ORDER BY b.created_at DESC",[u.id]);r.json({blocked:x.rows})}catch(e){r.status(500).json({error:"Não foi possível carregar bloqueios."})}});
+app.post("/api/security/block",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const target=await getUserByCode(q.body?.code);if(!target||Number(target.id)===Number(u.id))return r.status(400).json({error:"Usuário inválido."});await pool.query("INSERT INTO blocked_users(user_id,blocked_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,target.id]);await securityEvent(u.id,"USER_BLOCKED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{target:target.code}});r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível bloquear."})}});
+app.post("/api/security/unblock",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;await pool.query("DELETE FROM blocked_users WHERE user_id=$1 AND blocked_id=(SELECT id FROM users WHERE code=$2)",[u.id,String(q.body?.code||"").trim().toUpperCase()]);r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível desbloquear."})}});
+app.post("/api/security/report",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const target=await getUserByCode(q.body?.code);const reason=String(q.body?.reason||"").trim().slice(0,64),details=String(q.body?.details||"").trim().slice(0,1000);if(!target||Number(target.id)===Number(u.id)||!reason)return r.status(400).json({error:"Denúncia inválida."});await pool.query("INSERT INTO reports(reporter_id,target_id,reason,details) VALUES($1,$2,$3,$4)",[u.id,target.id,reason,details||null]);await securityEvent(u.id,"REPORT_CREATED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{target:target.code,reason}});r.json({ok:true,message:"Denúncia registrada."})}catch(e){r.status(500).json({error:"Não foi possível registrar a denúncia."})}});
+
 app.get("/api/friends",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const f=await pool.query(`SELECT u.name,u.email,u.code FROM friendships f JOIN users u ON u.id=f.friend_id WHERE f.user_id=$1 ORDER BY u.name`,[u.id]);const reqs=await pool.query(`SELECT u.name,u.email,u.code FROM friend_requests fr JOIN users u ON u.id=fr.sender_id WHERE fr.receiver_id=$1 AND fr.status='pending' ORDER BY fr.created_at DESC`,[u.id]);r.json({friends:f.rows.map(u2=>({...pub(u2),online:onlineByCode.has(u2.code)})),requests:reqs.rows.map(pub)})}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar amigos."})}});
-app.post("/api/friends/request",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Usuário não encontrado."});if(x.id===u.id)return r.status(400).json({error:"Você não pode adicionar a si mesmo."});const exists=await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[u.id,x.id]);if(exists.rowCount)return r.status(400).json({error:"Vocês já são amigos."});const reverse=await pool.query("SELECT 1 FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(reverse.rowCount)return r.status(400).json({error:"Esse usuário já enviou uma solicitação para você."});await pool.query("INSERT INTO friend_requests(sender_id,receiver_id,status) VALUES($1,$2,'pending') ON CONFLICT(sender_id,receiver_id) DO UPDATE SET status='pending'",[u.id,x.id]);notifyUser(x.code,"friend-request",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Novo convite de amizade",u.name+" quer ser seu amigo.",{code:u.code});r.json({message:"Solicitação enviada."})}catch(e){console.error(e);r.status(500).json({error:"Erro ao enviar solicitação."})}});
+app.post("/api/friends/request",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Usuário não encontrado."});if(x.id===u.id)return r.status(400).json({error:"Você não pode adicionar a si mesmo."});const privacy=await privacyFor(x.id);if(privacy.friend_policy==="nobody")return r.status(403).json({error:"Este usuário não aceita solicitações de amizade."});if(privacy.friend_policy==="friends"){const fof=await pool.query("SELECT 1 FROM friendships a JOIN friendships b ON a.friend_id=b.friend_id WHERE a.user_id=$1 AND b.user_id=$2 LIMIT 1",[u.id,x.id]);if(!fof.rowCount)return r.status(403).json({error:"Este usuário aceita apenas amigos de amigos."});}const exists=await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[u.id,x.id]);if(exists.rowCount)return r.status(400).json({error:"Vocês já são amigos."});const reverse=await pool.query("SELECT 1 FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(reverse.rowCount)return r.status(400).json({error:"Esse usuário já enviou uma solicitação para você."});await pool.query("INSERT INTO friend_requests(sender_id,receiver_id,status) VALUES($1,$2,'pending') ON CONFLICT(sender_id,receiver_id) DO UPDATE SET status='pending'",[u.id,x.id]);notifyUser(x.code,"friend-request",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Novo convite de amizade",u.name+" quer ser seu amigo.",{code:u.code});r.json({message:"Solicitação enviada."})}catch(e){console.error(e);r.status(500).json({error:"Erro ao enviar solicitação."})}});
 app.post("/api/friends/accept",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Solicitação não encontrada."});const a=await pool.query("SELECT id FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(!a.rowCount)return r.status(404).json({error:"Solicitação não encontrada."});const client=await pool.connect();try{await client.query("BEGIN");await client.query("UPDATE friend_requests SET status='accepted' WHERE id=$1",[a.rows[0].id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,x.id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[x.id,u.id]);await client.query("COMMIT")}catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}notifyUser(x.code,"friend-accepted",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Convite aceito",u.name+" aceitou seu convite.",{code:u.code});r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao aceitar solicitação."})}});
 app.post("/api/friends/reject",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Solicitação não encontrada."});const a=await pool.query("DELETE FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(!a.rowCount)return r.status(404).json({error:"Solicitação não encontrada."});r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao recusar solicitação."})}});
 app.post("/api/friends/remove",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").toUpperCase(),x=await getUserByCode(c);if(x){await pool.query("DELETE FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1)",[u.id,x.id])}r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao remover amigo."})}});
@@ -459,7 +511,7 @@ io.use(async(s,n)=>{try{
  const u=await getUserByEmail(sess.email);
  if(!u)return n(new Error("Sessão inválida"));
  sess.expires=Date.now()+SESSION_TTL_MS;
- await pool.query("UPDATE app_sessions SET expires_at=to_timestamp($2/1000.0) WHERE token=$1",[t,sess.expires]);
+ await pool.query("UPDATE app_sessions SET expires_at=to_timestamp($2/1000.0),last_seen_at=NOW() WHERE token=$1",[sessionHash(t),sess.expires]);
  s.data.user=u;n();
 }catch(e){console.error("socket-auth",e);n(new Error("Falha na autenticação"))}});
 io.on("connection",s=>{
@@ -547,8 +599,8 @@ io.on("connection",s=>{
      if(!rateLimit("call-invite:"+me.id,20,60*1000)){if(typeof ack==="function")ack({ok:false,error:"Muitos convites. Aguarde um pouco."});return;}
      const target=await getUserByCode(targetCode);
      if(!target){if(typeof ack==="function")ack({ok:false,error:"Amigo não encontrado."});return;}
-     const f=await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[me.id,target.id]);
-     if(!f.rowCount){if(typeof ack==="function")ack({ok:false,error:"Vocês precisam ser amigos para chamar."});return;}
+     const privacy=await privacyFor(target.id);
+     if(!(await canContact(target.id,me.id,privacy.call_policy))){if(typeof ack==="function")ack({ok:false,error:"Este usuário não permite chamadas de você."});return;}
      const delivered=notifyUser(target.code,"call-invite",{room:targetRoom,fromCode:me.code,fromName:me.name});
      if(typeof ack==="function")ack(delivered?{ok:true}:{ok:false,error:target.name+" está offline agora."});
    }catch(e){console.error("call-invite",e);if(typeof ack==="function")ack({ok:false,error:"Não foi possível enviar o convite."})}
@@ -564,4 +616,4 @@ io.on("connection",s=>{
 const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
-initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.5.3 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v3.0.2 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
