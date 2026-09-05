@@ -13,14 +13,16 @@ function allowOrigin(origin){
 }
 const corsOptions={origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST","OPTIONS"],credentials:false};
 app.use(cors(corsOptions));
-app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.setHeader("X-Frame-Options","DENY");res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");res.setHeader("Permissions-Policy","camera=(self), microphone=(self), display-capture=(self)");res.setHeader("Cross-Origin-Opener-Policy","same-origin");res.setHeader("Cross-Origin-Resource-Policy","cross-origin");res.setHeader("Content-Security-Policy","default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https: wss:; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data: https:; form-action 'self'");if(req.secure||req.headers["x-forwarded-proto"]==="https")res.setHeader("Strict-Transport-Security","max-age=31536000; includeSubDomains");next()});
+app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.setHeader("X-Frame-Options","DENY");res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");res.setHeader("Permissions-Policy","camera=(self), microphone=(self), display-capture=(self)");res.setHeader("Cross-Origin-Opener-Policy","same-origin");res.setHeader("Cross-Origin-Resource-Policy","cross-origin");res.setHeader("Content-Security-Policy","default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https: wss:; script-src 'self' https://cdn.socket.io; style-src 'self' 'unsafe-inline'; font-src 'self' data: https:; form-action 'self'");if(req.secure||req.headers["x-forwarded-proto"]==="https")res.setHeader("Strict-Transport-Security","max-age=31536000; includeSubDomains");next()});
 app.use(express.json({limit:"32kb"}));
-app.get("/health",(req,res)=>res.status(200).json({ok:true,service:"conversa-live-server",version:"3.0.4"}));
+
 const server=http.createServer(app);
 server.keepAliveTimeout=120000;
 server.headersTimeout=125000;
-const io=new Server(server,{path:"/socket.io",cors:{origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST"],credentials:false},transports:["polling","websocket"],allowEIO3:true});
+const io=new Server(server,{path:"/socket.io",addTrailingSlash:false,cors:{origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST"],credentials:false},transports:["polling","websocket"],allowEIO3:true,connectTimeout:10000});
 const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL?{rejectUnauthorized:false}:false});
+pool.on("error",e=>console.error("PostgreSQL pool error:",e?.message||e));
+let dbReady=false;
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024},fileFilter:(req,file,cb)=>{const mime=/^(image\/(jpeg|png|webp|gif)|video\/(mp4|webm|quicktime|ogg))$/i.test(file.mimetype);const name=String(file.originalname||"").normalize("NFKC");const ext=(name.match(/\.([A-Za-z0-9]{1,8})$/)||[])[1]?.toLowerCase();const allowed=(file.mimetype.startsWith("image/")?{jpeg:"image/jpeg",jpg:"image/jpeg",png:"image/png",webp:"image/webp",gif:"image/gif"}:{mp4:"video/mp4",webm:"video/webm",mov:"video/quicktime",ogg:"video/ogg",oga:"video/ogg"});const ok=!!ext&&mime&&allowed[ext]===file.mimetype.toLowerCase()&&!/\.(php|phtml|js|html|svg|exe|bat|cmd|sh)(\.|$)/i.test(name);cb(ok?null:new Error("Arquivo não permitido. Use uma imagem JPG/PNG/WEBP/GIF ou vídeo MP4/WebM/MOV/OGG."),ok)}});
 const sessions=new Map(),rooms=new Map(),calls=new Map(),callReady=new Map(),pendingSignals=new Map(),rateLimits=new Map(),roomMusic=new Map(),musicTokens=new Map();
 function validFileSignature(file){try{const b=file?.buffer;if(!b||!b.length)return false;const mime=String(file.mimetype||"").toLowerCase();if(mime==="image/jpeg")return b[0]===0xff&&b[1]===0xd8&&b[2]===0xff;if(mime==="image/png")return b.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]));if(mime==="image/gif")return b.subarray(0,6).toString()==="GIF87a"||b.subarray(0,6).toString()==="GIF89a";if(mime==="image/webp")return b.subarray(0,4).toString()==="RIFF"&&b.subarray(8,12).toString()==="WEBP";if(mime==="video/ogg")return b.subarray(0,4).toString()==="OggS";if(mime==="video/webm")return b.subarray(0,4).equals(Buffer.from([0x1a,0x45,0xdf,0xa3]));if(mime==="video/mp4"||mime==="video/quicktime")return b.length>12&&b.subarray(4,8).toString()==="ftyp";return false}catch(e){return false}}
@@ -222,8 +224,12 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v3.0.3 PostgreSQL + música"));
-app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"3.0.0"})}catch(e){r.status(503).json({ok:false,database:false,version:"3.0.0"})}});
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v3.0.6 PostgreSQL + música"));
+app.get("/health",async(_,r)=>{
+  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"3.0.6",service:"conversa-live-server"});
+  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"3.0.6",service:"conversa-live-server"})}
+  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"3.0.6",service:"conversa-live-server"})}
+});
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
 // Credentials stay on the server. Configure AUDIUS_API_KEY and/or
@@ -447,7 +453,7 @@ app.get("/api/messages/media/:id",async(q,r)=>{
   const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).end();
   const x=await pool.query(`SELECT sender_id,receiver_id,media_mime,media_name,media_size,media_data FROM direct_messages WHERE id=$1 AND media_data IS NOT NULL LIMIT 1`,[id]);
   const row=x.rows[0];if(!row)return r.status(404).end();
-  const mt=String(q.query?.mt||"");const viewerId=Number(row.sender_id);
+  const mt=String(q.query?.mt||"");
   // Token is checked against either participant below. The viewer id is encoded in the signed token.
   const senderOk=verifyMediaToken(mt,id,Number(row.sender_id));const receiverOk=verifyMediaToken(mt,id,Number(row.receiver_id));
   if(!senderOk&&!receiverOk)return r.status(403).end();
@@ -543,7 +549,7 @@ io.on("connection",s=>{
    for(const q of queued){
      if(q?.room===room&&valid(s,q.from))io.to(s.id).emit("signal",{from:q.from,data:q.data});
    }
-   if(h!==s.id)io.to(h).emit("call-participant-ready",{id:s.id,name:s.data.name});
+   for(const id of ready(room)){if(id!==s.id)io.to(id).emit("call-participant-ready",{id:s.id,name:s.data.name});}
  });
  s.on("call-ready-request",({room})=>{if(room===s.data.room&&calls.get(room)===s.id)s.emit("call-ready-users",[...ready(room)].filter(id=>id!==s.id&&valid(s,id)))});
  s.on("call-leave",({room})=>{if(room===s.data.room){cleanReady(room,s.id);pendingSignals.delete(s.id);s.to(room).emit("call-participant-left",{id:s.id})}});
@@ -622,4 +628,22 @@ io.on("connection",s=>{
 const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
-initDb().then(()=>server.listen(Number(process.env.PORT)||3000,"0.0.0.0",()=>console.log("Conversa Live v3.0.5 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+const PORT=Number(process.env.PORT)||3000;
+server.listen(PORT,"0.0.0.0",()=>{
+  console.log("Conversa Live v3.0.6 server ativo na porta "+PORT);
+  initDbWithRetry();
+});
+async function initDbWithRetry(){
+  for(;;){
+    try{
+      await initDb();
+      dbReady=true;
+      console.log("PostgreSQL conectado e banco pronto.");
+      return;
+    }catch(e){
+      dbReady=false;
+      console.error("Falha ao iniciar banco; nova tentativa em 5s:",e?.message||e);
+      await new Promise(r=>setTimeout(r,5000));
+    }
+  }
+}
