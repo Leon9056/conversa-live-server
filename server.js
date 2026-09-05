@@ -146,8 +146,8 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.2.0 PostgreSQL + música"));
-app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.2.0"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.2.0"})}});
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.3.0 PostgreSQL + música"));
+app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.3.0"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.3.0"})}});
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
 // Credentials stay on the server. Configure AUDIUS_API_KEY and/or
@@ -273,13 +273,12 @@ app.post("/api/messages",async(q,r)=>{
   const code=String(q.body?.code||"").trim().toUpperCase(),body=String(q.body?.body||"").trim();
   if(!body)return r.status(400).json({error:"Mensagem vazia."});
   if(body.length>4000)return r.status(400).json({error:"Mensagem muito longa."});
+  if(!rateLimit("dm:"+me.id,30,60*1000))return r.status(429).json({error:"Muitas mensagens em pouco tempo. Aguarde um instante."});
   const other=await getUserByCode(code);if(!other)return r.status(404).json({error:"Usuário não encontrado."});
   const f=await pool.query("SELECT 1 FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1) LIMIT 1",[me.id,other.id]);
   if(!f.rowCount)return r.status(403).json({error:"Vocês precisam ser amigos para conversar."});
   const x=await pool.query("INSERT INTO direct_messages(sender_id,receiver_id,body) VALUES($1,$2,$3) RETURNING id,sender_id,receiver_id,body,created_at,read_at",[me.id,other.id,body]);
-  for(const [sid,ss] of io.sockets.sockets){
-    if(Number(ss.data?.user?.id)===Number(other.id))io.to(sid).emit("dm-new",{code:me.code,message:x.rows[0]});
-  }
+  notifyUser(other.code,"dm-new",{code:me.code,message:x.rows[0]});
   r.json({message:x.rows[0]});
  }catch(e){console.error(e);r.status(500).json({error:"Não foi possível enviar a mensagem."})}
 });
@@ -373,4 +372,4 @@ io.on("connection",s=>{
  s.on("disconnect",()=>{const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
-initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.2.0 server ativo com PostgreSQL + mensagens diretas + music bot + convites de call + leave-room"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.3.0 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
