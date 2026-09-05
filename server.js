@@ -186,8 +186,8 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.5.0 PostgreSQL + música"));
-app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.5.0"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.5.0"})}});
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.5.2 PostgreSQL + música"));
+app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.5.2"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.5.2"})}});
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
 // Credentials stay on the server. Configure AUDIUS_API_KEY and/or
@@ -261,7 +261,7 @@ app.get("/api/feed/media/:id",async(q,r)=>{try{
  if(!tokenOk)return r.status(403).end();
  const buf=row.media_data,total=buf.length,mime=row.media_mime||"application/octet-stream";
  r.setHeader("Content-Type",mime);r.setHeader("Content-Disposition",`inline; filename*=UTF-8''${encodeURIComponent(row.media_name||"media")}`);
- r.setHeader("Accept-Ranges","bytes");r.setHeader("Cache-Control","private, max-age=86400");
+ r.setHeader("Accept-Ranges","bytes");r.setHeader("Cache-Control","private, max-age=3600");
  const range=String(q.headers.range||"");
  if(range){const m=range.match(/bytes=(\d*)-(\d*)/);if(m){let start=m[1]?Number(m[1]):Math.max(0,total-(Number(m[2]||0)+1));let end=m[2]?Number(m[2]):total-1;
    if(start<0||end<start||start>=total){r.status(416).setHeader("Content-Range",`bytes */${total}`).end();return}
@@ -405,7 +405,7 @@ app.get("/api/messages/media/:id",async(q,r)=>{
   // Token is checked against either participant below. The viewer id is encoded in the signed token.
   const senderOk=verifyMediaToken(mt,id,Number(row.sender_id));const receiverOk=verifyMediaToken(mt,id,Number(row.receiver_id));
   if(!senderOk&&!receiverOk)return r.status(403).end();
-  const buf=row.media_data;const total=buf.length;const mime=row.media_mime||"application/octet-stream";r.setHeader("Content-Type",mime);r.setHeader("Content-Disposition",`inline; filename*=UTF-8''${encodeURIComponent(row.media_name||"media")}`);r.setHeader("Accept-Ranges","bytes");r.setHeader("Cache-Control","private, max-age=86400");
+  const buf=row.media_data;const total=buf.length;const mime=row.media_mime||"application/octet-stream";r.setHeader("Content-Type",mime);r.setHeader("Content-Disposition",`inline; filename*=UTF-8''${encodeURIComponent(row.media_name||"media")}`);r.setHeader("Accept-Ranges","bytes");r.setHeader("Cache-Control","private, max-age=3600");
   const range=String(q.headers.range||"");
   if(range){const m=range.match(/bytes=(\d*)-(\d*)/);if(m){let start=m[1]?Number(m[1]):Math.max(0,total-(Number(m[2]||0)+1));let end=m[2]?Number(m[2]):total-1;if(start<0||end<start||start>=total){r.status(416).setHeader("Content-Range",`bytes */${total}`).end();return}end=Math.min(end,total-1);r.status(206).setHeader("Content-Range",`bytes ${start}-${end}/${total}`);r.setHeader("Content-Length",end-start+1);return r.end(buf.subarray(start,end+1));}}
   r.setHeader("Content-Length",total);r.end(buf);
@@ -534,4 +534,4 @@ io.on("connection",s=>{
  s.on("disconnect",()=>{const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
-initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.5.0 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.5.2 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
