@@ -186,8 +186,8 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.5.3 PostgreSQL + música"));
-app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.5.3"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.5.3"})}});
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v3.0.0 PostgreSQL + música"));
+app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"3.0.0"})}catch(e){r.status(503).json({ok:false,database:false,version:"3.0.0"})}});
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
 // Credentials stay on the server. Configure AUDIUS_API_KEY and/or
@@ -510,7 +510,7 @@ io.on("connection",s=>{
  s.on("music-volume",({room,volume})=>{if(!musicController(s,room))return;const st=roomMusic.get(room);if(!st)return;st.volume=Math.max(0,Math.min(1,Number(volume)||0));roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));});
  s.on("music-queue",({room})=>{if(room!==s.data.room)return;const q=roomMusic.get(room)?.queue||[];s.emit("system",q.length?"🎵 Fila ("+q.length+"):\n"+q.slice(0,15).map((x,i)=>(i+1)+". "+x.title+" — "+x.artist).join("\n"):"🎵 A fila está vazia.");});
  s.on("music-stop",({room})=>{if(!musicController(s,room))return;roomMusic.delete(room);io.to(room).emit("music-stop");io.to(room).emit("system",s.data.name+" parou a música e limpou a fila.");});
- s.on("signal",({to,data})=>{if(!to||!valid(s,to))return;const set=callReady.get(s.data.room);if(set?.has(s.id)&&set.has(to))io.to(to).emit("signal",{from:s.id,data})});
+ s.on("signal",({to,data})=>{const rm=s.data.room;if(!rm||!to||!valid(s,to)||!calls.has(rm))return;const target=io.sockets.sockets.get(to);if(!target||target.data?.room!==rm)return;io.to(to).emit("signal",{from:s.id,data})});
  s.on("call-invite",async({code,room},ack)=>{
    try{
      const me=s.data.user;
