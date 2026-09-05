@@ -59,8 +59,17 @@ async function initDb(){
  )`);
  await pool.query(`CREATE TABLE IF NOT EXISTS social_posts(
    id BIGSERIAL PRIMARY KEY, author_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   body VARCHAR(1000) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+   body VARCHAR(1000), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+   media_type VARCHAR(16), media_name VARCHAR(180), media_mime VARCHAR(120),
+   media_size INTEGER, media_duration REAL, media_data BYTEA
  )`);
+ await pool.query("ALTER TABLE social_posts ALTER COLUMN body DROP NOT NULL");
+ await pool.query("ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS media_type VARCHAR(16)");
+ await pool.query("ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS media_name VARCHAR(180)");
+ await pool.query("ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS media_mime VARCHAR(120)");
+ await pool.query("ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS media_size INTEGER");
+ await pool.query("ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS media_duration REAL");
+ await pool.query("ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS media_data BYTEA");
  await pool.query(`CREATE TABLE IF NOT EXISTS social_likes(
    post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(post_id,user_id)
@@ -89,6 +98,7 @@ async function initDb(){
  await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_name VARCHAR(180)");
  await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_mime VARCHAR(120)");
  await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_size INTEGER");
+ await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_duration REAL");
  await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_data BYTEA");
  await pool.query("CREATE INDEX IF NOT EXISTS direct_messages_pair_idx ON direct_messages(sender_id,receiver_id,created_at DESC)");
  await pool.query(`CREATE TABLE IF NOT EXISTS app_sessions(
@@ -176,16 +186,89 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.4.2 PostgreSQL + música"));
-app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.4.2"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.4.2"})}});
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.5.0 PostgreSQL + música"));
+app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.5.0"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.5.0"})}});
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
 // Credentials stay on the server. Configure AUDIUS_API_KEY and/or
 // AUDIUS_BEARER_TOKEN in Render when required by the Audius API plan.
 app.get("/api/me",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;r.json({user:pub(u)})}catch(e){r.status(500).json({error:"Erro ao carregar perfil."})}});
 app.patch("/api/me",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const name=cleanName(q.body?.name);if(name.length<2)return r.status(400).json({error:"O nome precisa ter pelo menos 2 caracteres."});await pool.query("UPDATE users SET name=$1 WHERE id=$2",[name,u.id]);const updated=await getUserById(u.id);r.json({user:pub(updated)})}catch(e){console.error(e);r.status(500).json({error:"Não foi possível salvar o perfil."})}});
-app.get("/api/feed",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const limit=Math.min(Math.max(Number(q.query.limit)||30,1),50);const x=await pool.query(`SELECT p.id,p.body,p.created_at,u.id AS author_id,u.name,u.code,COUNT(l.post_id)::int AS likes,BOOL_OR(l.user_id=$1) AS liked FROM social_posts p JOIN users u ON u.id=p.author_id LEFT JOIN social_likes l ON l.post_id=p.id WHERE p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1) GROUP BY p.id,u.id ORDER BY p.created_at DESC LIMIT $2`,[u.id,limit]);r.json({posts:x.rows.map(p=>({...p,liked:!!p.liked}))})}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar o feed."})}});
-app.post("/api/feed",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const body=String(q.body?.body||"").trim();if(body.length<1)return r.status(400).json({error:"Escreva algo antes de publicar."});if(body.length>1000)return r.status(400).json({error:"A publicação pode ter no máximo 1000 caracteres."});const x=await pool.query("INSERT INTO social_posts(author_id,body) VALUES($1,$2) RETURNING id,body,created_at",[u.id,body]);r.json({post:{...x.rows[0],author_id:u.id,name:u.name,code:u.code,likes:0,liked:false}})}catch(e){console.error(e);r.status(500).json({error:"Não foi possível publicar."})}});
+function feedPublic(row,viewerId){
+ return {
+  id:row.id,body:row.body||"",created_at:row.created_at,author_id:row.author_id,name:row.name,code:row.code,
+  likes:Number(row.likes||0),liked:!!row.liked,
+  media:row.media_id?{id:row.media_id,type:row.media_type,name:row.media_name,mime:row.media_mime,size:Number(row.media_size||0),duration:Number(row.media_duration||0),url:"/api/feed/media/"+row.media_id+"?mt="+encodeURIComponent(makeMediaToken(row.media_id,viewerId))}:null
+ };
+}
+app.get("/api/feed",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const limit=Math.min(Math.max(Number(q.query.limit)||30,1),50);
+ const x=await pool.query(`SELECT p.id,p.body,p.created_at,p.media_type,p.media_name,p.media_mime,p.media_size,p.media_duration,
+   CASE WHEN p.media_data IS NOT NULL THEN p.id END AS media_id,
+   u.id AS author_id,u.name,u.code,COUNT(l.post_id)::int AS likes,BOOL_OR(l.user_id=$1) AS liked
+   FROM social_posts p JOIN users u ON u.id=p.author_id
+   LEFT JOIN social_likes l ON l.post_id=p.id
+   WHERE p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1)
+   GROUP BY p.id,u.id ORDER BY p.created_at DESC LIMIT $2`,[u.id,limit]);
+ r.json({posts:x.rows.map(p=>feedPublic(p,u.id))});
+}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar o feed."})}});
+
+app.post("/api/feed",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const body=String(q.body?.body||"").trim();
+ if(body.length<1)return r.status(400).json({error:"Escreva algo antes de publicar."});
+ if(body.length>1000)return r.status(400).json({error:"A publicação pode ter no máximo 1000 caracteres."});
+ const x=await pool.query("INSERT INTO social_posts(author_id,body) VALUES($1,$2) RETURNING id,body,created_at",[u.id,body]);
+ r.json({post:{...x.rows[0],author_id:u.id,name:u.name,code:u.code,likes:0,liked:false,media:null}});
+}catch(e){console.error(e);r.status(500).json({error:"Não foi possível publicar."})}});
+
+app.post("/api/feed/media",(req,res,next)=>{
+ upload.single("file")(req,res,err=>{
+   if(err)return res.status(err.code==="LIMIT_FILE_SIZE"?413:400).json({error:err.message||"Não foi possível receber a mídia."});
+   next();
+ });
+},async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const body=String(q.body?.body||"").trim();
+ const duration=Number(q.body?.duration||0);
+ if(body.length>1000)return r.status(400).json({error:"A publicação pode ter no máximo 1000 caracteres."});
+ if(!q.file)return r.status(400).json({error:"Escolha uma foto ou vídeo."});
+ if(q.file.size>20*1024*1024)return r.status(413).json({error:"A mídia precisa ter no máximo 20 MB."});
+ const isVideo=q.file.mimetype.startsWith("video/");
+ if(isVideo && (!Number.isFinite(duration)||duration<=0||duration>60.5))return r.status(400).json({error:"Os vídeos precisam ter até 1 minuto."});
+ if(!body && !q.file)return r.status(400).json({error:"Adicione uma legenda ou mídia."});
+ if(!rateLimit("feed-media:"+u.id,8,60*1000))return r.status(429).json({error:"Muitas publicações com mídia. Aguarde um pouco."});
+ const kind=q.file.mimetype.startsWith("image/")?"image":"video";
+ const x=await pool.query(`INSERT INTO social_posts(author_id,body,media_type,media_name,media_mime,media_size,media_duration,media_data)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,body,created_at`,[
+   u.id,body||null,kind,String(q.file.originalname||"media").slice(0,180),q.file.mimetype,q.file.size,isVideo?duration:null,q.file.buffer
+ ]);
+ r.json({post:{...x.rows[0],author_id:u.id,name:u.name,code:u.code,likes:0,liked:false}});
+}catch(e){console.error("feed-media-upload",e);r.status(500).json({error:"Não foi possível publicar a mídia."})}});
+
+app.get("/api/feed/media/:id",async(q,r)=>{try{
+ const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).end();
+ const x=await pool.query(`SELECT p.id,p.author_id,p.media_mime,p.media_name,p.media_size,p.media_data
+   FROM social_posts p WHERE p.id=$1 AND p.media_data IS NOT NULL LIMIT 1`,[id]);
+ const row=x.rows[0];if(!row)return r.status(404).end();
+ const me=await auth(q,r);if(!me)return;
+ const allowed=Number(row.author_id)===Number(me.id) || (await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[me.id,row.author_id])).rowCount;
+ if(!allowed)return r.status(403).end();
+ const mt=String(q.query?.mt||"");
+ // feed media tokens are signed with the same media secret and viewer id
+ const tokenOk=verifyMediaToken(mt,id,me.id);
+ if(!tokenOk)return r.status(403).end();
+ const buf=row.media_data,total=buf.length,mime=row.media_mime||"application/octet-stream";
+ r.setHeader("Content-Type",mime);r.setHeader("Content-Disposition",`inline; filename*=UTF-8''${encodeURIComponent(row.media_name||"media")}`);
+ r.setHeader("Accept-Ranges","bytes");r.setHeader("Cache-Control","private, max-age=86400");
+ const range=String(q.headers.range||"");
+ if(range){const m=range.match(/bytes=(\d*)-(\d*)/);if(m){let start=m[1]?Number(m[1]):Math.max(0,total-(Number(m[2]||0)+1));let end=m[2]?Number(m[2]):total-1;
+   if(start<0||end<start||start>=total){r.status(416).setHeader("Content-Range",`bytes */${total}`).end();return}
+   end=Math.min(end,total-1);r.status(206).setHeader("Content-Range",`bytes ${start}-${end}/${total}`);r.setHeader("Content-Length",end-start+1);return r.end(buf.subarray(start,end+1));}}
+ r.setHeader("Content-Length",total);r.end(buf);
+}catch(e){console.error("feed-media",e);r.status(500).end()}});
+
 app.post("/api/feed/:id/like",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);const exists=await pool.query("SELECT 1 FROM social_likes WHERE post_id=$1 AND user_id=$2",[id,u.id]);let liked;if(exists.rowCount){await pool.query("DELETE FROM social_likes WHERE post_id=$1 AND user_id=$2",[id,u.id]);liked=false}else{await pool.query("INSERT INTO social_likes(post_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[id,u.id]);liked=true}const c=await pool.query("SELECT COUNT(*)::int AS likes FROM social_likes WHERE post_id=$1",[id]);r.json({liked,likes:c.rows[0].likes})}catch(e){r.status(500).json({error:"Não foi possível reagir."})}});
 app.get("/api/notifications",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const x=await pool.query("SELECT id,type,title,body,data,read_at,created_at FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50",[u.id]);const unread=x.rows.filter(n=>!n.read_at).length;r.json({notifications:x.rows,unread})}catch(e){r.status(500).json({error:"Erro ao carregar notificações."})}});
 app.post("/api/notifications/read",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;await pool.query("UPDATE notifications SET read_at=NOW() WHERE user_id=$1 AND read_at IS NULL",[u.id]);r.json({ok:true})}catch(e){r.status(500).json({error:"Erro ao marcar notificações."})}});
@@ -293,7 +376,7 @@ async function getFriendForDM(me,code){
 const mediaSecret=String(process.env.SESSION_SECRET||process.env.DATABASE_URL||crypto.randomBytes(32).toString("hex"));
 function makeMediaToken(messageId,userId){const exp=Math.floor(Date.now()/1000)+60*30;const raw=`${messageId}.${userId}.${exp}`;const sig=crypto.createHmac("sha256",mediaSecret).update(raw).digest("base64url");return Buffer.from(`${raw}.${sig}`).toString("base64url");}
 function verifyMediaToken(token,messageId,userId){try{const raw=Buffer.from(String(token||""),"base64url").toString();const parts=raw.split(".");if(parts.length!==4)return false;const [mid,uid,exp,sig]=parts;if(Number(mid)!==Number(messageId)||Number(uid)!==Number(userId)||Number(exp)<Math.floor(Date.now()/1000))return false;const expected=crypto.createHmac("sha256",mediaSecret).update(`${mid}.${uid}.${exp}`).digest("base64url");return crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(expected));}catch(e){return false}}
-function messagePublic(row,viewerId){return {id:row.id,sender_id:row.sender_id,receiver_id:row.receiver_id,body:row.body||"",created_at:row.created_at,read_at:row.read_at,media:row.media_id?{id:row.media_id,type:row.media_type,name:row.media_name,mime:row.media_mime,size:Number(row.media_size||0),url:"/api/messages/media/"+row.media_id+"?mt="+encodeURIComponent(makeMediaToken(row.media_id,viewerId))}:null};}
+function messagePublic(row,viewerId){return {id:row.id,sender_id:row.sender_id,receiver_id:row.receiver_id,body:row.body||"",created_at:row.created_at,read_at:row.read_at,media:row.media_id?{id:row.media_id,type:row.media_type,name:row.media_name,mime:row.media_mime,size:Number(row.media_size||0),duration:Number(row.media_duration||0),url:"/api/messages/media/"+row.media_id+"?mt="+encodeURIComponent(makeMediaToken(row.media_id,viewerId))}:null};}
 app.get("/api/messages/unread",async(q,r)=>{
  try{
   const me=await auth(q,r);if(!me)return;
@@ -337,7 +420,10 @@ app.post("/api/messages",async(q,r)=>{
   if(!rateLimit("dm:"+me.id,40,60*1000))return r.status(429).json({error:"Muitas mensagens em pouco tempo. Aguarde um instante."});
   const {other,error,status}=await getFriendForDM(me,code);if(error)return r.status(status).json({error});
   const x=await pool.query("INSERT INTO direct_messages(sender_id,receiver_id,body) VALUES($1,$2,$3) RETURNING id,sender_id,receiver_id,body,created_at,read_at",[me.id,other.id,body]);
-  const message=messagePublic(x.rows[0],me.id);notifyUser(other.code,"dm-new",{code:me.code,fromName:me.name,message}); await addNotification(other.id,"message","Nova mensagem",me.name+" enviou uma mensagem.",{code:me.code});
+  const message=messagePublic(x.rows[0],me.id);
+  const receiverMessage=messagePublic(x.rows[0],other.id);
+  notifyUser(other.code,"dm-new",{code:me.code,fromName:me.name,message:receiverMessage});
+  await addNotification(other.id,"message","Nova mensagem",me.name+" enviou uma mensagem.",{code:me.code});
   r.json({message});
  }catch(e){console.error(e);r.status(500).json({error:"Não foi possível enviar a mensagem."})}
 });
@@ -348,11 +434,13 @@ app.post("/api/messages/media",(req,res,next)=>{upload.single("file")(req,res,er
   if(caption.length>4000)return r.status(400).json({error:"Legenda muito longa."});
   if(!q.file)return r.status(400).json({error:"Escolha uma foto ou vídeo."});
   if(q.file.size>20*1024*1024)return r.status(413).json({error:"Arquivo muito grande. O limite é 20 MB."});
+  const duration=Number(q.body?.duration||0);
+  if(q.file.mimetype.startsWith("video/") && (!Number.isFinite(duration)||duration<=0||duration>60.5))return r.status(400).json({error:"Os vídeos precisam ter até 1 minuto."});
   const {other,error,status}=await getFriendForDM(me,code);if(error)return r.status(status).json({error});
   if(!rateLimit("dm-media:"+me.id,12,60*1000))return r.status(429).json({error:"Muitos arquivos enviados. Aguarde um pouco."});
   const kind=q.file.mimetype.startsWith("image/")?"image":"video";
-  const x=await pool.query(`INSERT INTO direct_messages(sender_id,receiver_id,body,media_type,media_name,media_mime,media_size,media_data) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,sender_id,receiver_id,body,created_at,read_at`,[me.id,other.id,caption||null,kind,String(q.file.originalname||"media").slice(0,180),q.file.mimetype,q.file.size,q.file.buffer]);
-  const row=await pool.query("SELECT CASE WHEN media_data IS NOT NULL THEN id END AS media_id,media_type,media_name,media_mime,media_size FROM direct_messages WHERE id=$1",[x.rows[0].id]);
+  const x=await pool.query(`INSERT INTO direct_messages(sender_id,receiver_id,body,media_type,media_name,media_mime,media_size,media_duration,media_data) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,sender_id,receiver_id,body,created_at,read_at`,[me.id,other.id,caption||null,kind,String(q.file.originalname||"media").slice(0,180),q.file.mimetype,q.file.size,q.file.mimetype.startsWith("video/")?duration:null,q.file.buffer]);
+  const row=await pool.query("SELECT CASE WHEN media_data IS NOT NULL THEN id END AS media_id,media_type,media_name,media_mime,media_size,media_duration FROM direct_messages WHERE id=$1",[x.rows[0].id]);
   const message=messagePublic({...x.rows[0],...row.rows[0]},me.id);notifyUser(other.code,"dm-new",{code:me.code,fromName:me.name,message}); await addNotification(other.id,"message","Nova mensagem",me.name+" enviou uma mensagem.",{code:me.code});r.json({message});
  }catch(e){console.error("message-media-upload",e);r.status(500).json({error:"Não foi possível enviar o arquivo."})}
 });
@@ -446,4 +534,4 @@ io.on("connection",s=>{
  s.on("disconnect",()=>{const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
-initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.4.2 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.5.0 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
