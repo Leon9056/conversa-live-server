@@ -1,4 +1,4 @@
-const express=require("express"),http=require("http"),cors=require("cors"),crypto=require("crypto"),{Server}=require("socket.io"),{Pool}=require("pg");
+const express=require("express"),http=require("http"),cors=require("cors"),crypto=require("crypto"),multer=require("multer"),{Server}=require("socket.io"),{Pool}=require("pg");
 const app=express();
 app.set("trust proxy",1);
 const configuredOrigins=String(process.env.FRONTEND_URL||"").split(",").map(v=>v.trim()).filter(Boolean);
@@ -15,6 +15,7 @@ app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.s
 app.use(express.json({limit:"32kb"}));
 const server=http.createServer(app),io=new Server(server,{cors:{origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST"]}});
 const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL?{rejectUnauthorized:false}:false});
+const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024},fileFilter:(req,file,cb)=>{const ok=/^(image\/(jpeg|png|webp|gif)|video\/(mp4|webm|quicktime|ogg))$/i.test(file.mimetype);cb(ok?null:new Error("Formato não suportado. Use JPG, PNG, WEBP ou vídeo MP4/WebM."),ok)}});
 const sessions=new Map(),rooms=new Map(),calls=new Map(),callReady=new Map(),rateLimits=new Map(),roomMusic=new Map(),musicTokens=new Map();
 const onlineByCode=new Map(); // code -> Set(socketId), presence independent of any room
 function notifyUser(code,event,payload){
@@ -56,10 +57,22 @@ async function initDb(){
    id BIGSERIAL PRIMARY KEY,
    sender_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    receiver_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   body TEXT NOT NULL CHECK(length(body) BETWEEN 1 AND 4000),
+   body TEXT,
+   media_type VARCHAR(16),
+   media_name VARCHAR(180),
+   media_mime VARCHAR(120),
+   media_size INTEGER,
+   media_data BYTEA,
    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
    read_at TIMESTAMPTZ
  )`);
+ await pool.query("ALTER TABLE direct_messages ALTER COLUMN body DROP NOT NULL");
+ await pool.query("ALTER TABLE direct_messages DROP CONSTRAINT IF EXISTS direct_messages_body_check");
+ await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_type VARCHAR(16)");
+ await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_name VARCHAR(180)");
+ await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_mime VARCHAR(120)");
+ await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_size INTEGER");
+ await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_data BYTEA");
  await pool.query("CREATE INDEX IF NOT EXISTS direct_messages_pair_idx ON direct_messages(sender_id,receiver_id,created_at DESC)");
  await pool.query(`CREATE TABLE IF NOT EXISTS app_sessions(
    token TEXT PRIMARY KEY,
@@ -146,8 +159,8 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.3.0 PostgreSQL + música"));
-app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.3.0"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.3.0"})}});
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.3.1 PostgreSQL + música"));
+app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.3.1"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.3.1"})}});
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
 // Credentials stay on the server. Configure AUDIUS_API_KEY and/or
@@ -245,6 +258,18 @@ app.post("/api/login",guard,async(q,r)=>{
 });
 
 
+async function getFriendForDM(me,code){
+ const other=await getUserByCode(String(code||"").trim().toUpperCase());
+ if(!other)return {error:"Usuário não encontrado.",status:404};
+ if(Number(other.id)===Number(me.id))return {error:"Você não pode conversar consigo mesmo.",status:400};
+ const f=await pool.query("SELECT 1 FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1) LIMIT 1",[me.id,other.id]);
+ if(!f.rowCount)return {error:"Vocês precisam ser amigos para conversar.",status:403};
+ return {other};
+}
+const mediaSecret=String(process.env.SESSION_SECRET||process.env.DATABASE_URL||crypto.randomBytes(32).toString("hex"));
+function makeMediaToken(messageId,userId){const exp=Math.floor(Date.now()/1000)+60*30;const raw=`${messageId}.${userId}.${exp}`;const sig=crypto.createHmac("sha256",mediaSecret).update(raw).digest("base64url");return Buffer.from(`${raw}.${sig}`).toString("base64url");}
+function verifyMediaToken(token,messageId,userId){try{const raw=Buffer.from(String(token||""),"base64url").toString();const parts=raw.split(".");if(parts.length!==4)return false;const [mid,uid,exp,sig]=parts;if(Number(mid)!==Number(messageId)||Number(uid)!==Number(userId)||Number(exp)<Math.floor(Date.now()/1000))return false;const expected=crypto.createHmac("sha256",mediaSecret).update(`${mid}.${uid}.${exp}`).digest("base64url");return crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(expected));}catch(e){return false}}
+function messagePublic(row,viewerId){return {id:row.id,sender_id:row.sender_id,receiver_id:row.receiver_id,body:row.body||"",created_at:row.created_at,read_at:row.read_at,media:row.media_id?{id:row.media_id,type:row.media_type,name:row.media_name,mime:row.media_mime,size:Number(row.media_size||0),url:"/api/messages/media/"+row.media_id+"?mt="+encodeURIComponent(makeMediaToken(row.media_id,viewerId))}:null};}
 app.get("/api/messages/unread",async(q,r)=>{
  try{
   const me=await auth(q,r);if(!me)return;
@@ -255,17 +280,29 @@ app.get("/api/messages/unread",async(q,r)=>{
 app.get("/api/messages/:code",async(q,r)=>{
  try{
   const me=await auth(q,r);if(!me)return;
-  const other=await getUserByCode(String(q.params.code||"").trim().toUpperCase());
-  if(!other)return r.status(404).json({error:"Usuário não encontrado."});
-  if(Number(other.id)===Number(me.id))return r.status(400).json({error:"Você não pode conversar consigo mesmo."});
-  const f=await pool.query("SELECT 1 FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1) LIMIT 1",[me.id,other.id]);
-  if(!f.rowCount)return r.status(403).json({error:"Vocês precisam ser amigos para conversar."});
-  const x=await pool.query(`SELECT id,sender_id,receiver_id,body,created_at,read_at FROM direct_messages
-    WHERE (sender_id=$1 AND receiver_id=$2) OR (sender_id=$2 AND receiver_id=$1)
-    ORDER BY created_at ASC LIMIT 200`,[me.id,other.id]);
+  const {other,error,status}=await getFriendForDM(me,q.params.code);if(error)return r.status(status).json({error});
+  const x=await pool.query(`SELECT id,sender_id,receiver_id,body,created_at,read_at,
+    CASE WHEN media_data IS NOT NULL THEN id END AS media_id,media_type,media_name,media_mime,media_size
+    FROM direct_messages WHERE (sender_id=$1 AND receiver_id=$2) OR (sender_id=$2 AND receiver_id=$1)
+    ORDER BY created_at ASC LIMIT 300`,[me.id,other.id]);
   await pool.query("UPDATE direct_messages SET read_at=NOW() WHERE receiver_id=$1 AND sender_id=$2 AND read_at IS NULL",[me.id,other.id]);
-  r.json({friend:pub(other),messages:x.rows});
+  r.json({friend:pub(other),messages:x.rows.map(row=>messagePublic(row,me.id))});
  }catch(e){console.error(e);r.status(500).json({error:"Não foi possível carregar as mensagens."})}
+});
+app.get("/api/messages/media/:id",async(q,r)=>{
+ try{
+  const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).end();
+  const x=await pool.query(`SELECT sender_id,receiver_id,media_mime,media_name,media_size,media_data FROM direct_messages WHERE id=$1 AND media_data IS NOT NULL LIMIT 1`,[id]);
+  const row=x.rows[0];if(!row)return r.status(404).end();
+  const mt=String(q.query?.mt||"");const viewerId=Number(row.sender_id);
+  // Token is checked against either participant below. The viewer id is encoded in the signed token.
+  const senderOk=verifyMediaToken(mt,id,Number(row.sender_id));const receiverOk=verifyMediaToken(mt,id,Number(row.receiver_id));
+  if(!senderOk&&!receiverOk)return r.status(403).end();
+  const buf=row.media_data;const total=buf.length;const mime=row.media_mime||"application/octet-stream";r.setHeader("Content-Type",mime);r.setHeader("Content-Disposition",`inline; filename*=UTF-8''${encodeURIComponent(row.media_name||"media")}`);r.setHeader("Accept-Ranges","bytes");r.setHeader("Cache-Control","private, max-age=86400");
+  const range=String(q.headers.range||"");
+  if(range){const m=range.match(/bytes=(\d*)-(\d*)/);if(m){let start=m[1]?Number(m[1]):Math.max(0,total-(Number(m[2]||0)+1));let end=m[2]?Number(m[2]):total-1;if(start<0||end<start||start>=total){r.status(416).setHeader("Content-Range",`bytes */${total}`).end();return}end=Math.min(end,total-1);r.status(206).setHeader("Content-Range",`bytes ${start}-${end}/${total}`);r.setHeader("Content-Length",end-start+1);return r.end(buf.subarray(start,end+1));}}
+  r.setHeader("Content-Length",total);r.end(buf);
+ }catch(e){console.error("message-media",e);r.status(500).end()}
 });
 app.post("/api/messages",async(q,r)=>{
  try{
@@ -273,14 +310,27 @@ app.post("/api/messages",async(q,r)=>{
   const code=String(q.body?.code||"").trim().toUpperCase(),body=String(q.body?.body||"").trim();
   if(!body)return r.status(400).json({error:"Mensagem vazia."});
   if(body.length>4000)return r.status(400).json({error:"Mensagem muito longa."});
-  if(!rateLimit("dm:"+me.id,30,60*1000))return r.status(429).json({error:"Muitas mensagens em pouco tempo. Aguarde um instante."});
-  const other=await getUserByCode(code);if(!other)return r.status(404).json({error:"Usuário não encontrado."});
-  const f=await pool.query("SELECT 1 FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1) LIMIT 1",[me.id,other.id]);
-  if(!f.rowCount)return r.status(403).json({error:"Vocês precisam ser amigos para conversar."});
+  if(!rateLimit("dm:"+me.id,40,60*1000))return r.status(429).json({error:"Muitas mensagens em pouco tempo. Aguarde um instante."});
+  const {other,error,status}=await getFriendForDM(me,code);if(error)return r.status(status).json({error});
   const x=await pool.query("INSERT INTO direct_messages(sender_id,receiver_id,body) VALUES($1,$2,$3) RETURNING id,sender_id,receiver_id,body,created_at,read_at",[me.id,other.id,body]);
-  notifyUser(other.code,"dm-new",{code:me.code,message:x.rows[0]});
-  r.json({message:x.rows[0]});
+  const message=messagePublic(x.rows[0],me.id);notifyUser(other.code,"dm-new",{code:me.code,fromName:me.name,message});
+  r.json({message});
  }catch(e){console.error(e);r.status(500).json({error:"Não foi possível enviar a mensagem."})}
+});
+app.post("/api/messages/media",(req,res,next)=>{upload.single("file")(req,res,err=>{if(err){return res.status(err.code==="LIMIT_FILE_SIZE"?413:400).json({error:err.message||"Não foi possível receber o arquivo."})}next()})},async(q,r)=>{
+ try{
+  const me=await auth(q,r);if(!me)return;
+  const code=String(q.body?.code||"").trim().toUpperCase(),caption=String(q.body?.body||"").trim();
+  if(caption.length>4000)return r.status(400).json({error:"Legenda muito longa."});
+  if(!q.file)return r.status(400).json({error:"Escolha uma foto ou vídeo."});
+  if(q.file.size>20*1024*1024)return r.status(413).json({error:"Arquivo muito grande. O limite é 20 MB."});
+  const {other,error,status}=await getFriendForDM(me,code);if(error)return r.status(status).json({error});
+  if(!rateLimit("dm-media:"+me.id,12,60*1000))return r.status(429).json({error:"Muitos arquivos enviados. Aguarde um pouco."});
+  const kind=q.file.mimetype.startsWith("image/")?"image":"video";
+  const x=await pool.query(`INSERT INTO direct_messages(sender_id,receiver_id,body,media_type,media_name,media_mime,media_size,media_data) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,sender_id,receiver_id,body,created_at,read_at`,[me.id,other.id,caption||null,kind,String(q.file.originalname||"media").slice(0,180),q.file.mimetype,q.file.size,q.file.buffer]);
+  const row=await pool.query("SELECT CASE WHEN media_data IS NOT NULL THEN id END AS media_id,media_type,media_name,media_mime,media_size FROM direct_messages WHERE id=$1",[x.rows[0].id]);
+  const message=messagePublic({...x.rows[0],...row.rows[0]},me.id);notifyUser(other.code,"dm-new",{code:me.code,fromName:me.name,message});r.json({message});
+ }catch(e){console.error("message-media-upload",e);r.status(500).json({error:"Não foi possível enviar o arquivo."})}
 });
 app.get("/api/friends",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const f=await pool.query(`SELECT u.name,u.email,u.code FROM friendships f JOIN users u ON u.id=f.friend_id WHERE f.user_id=$1 ORDER BY u.name`,[u.id]);const reqs=await pool.query(`SELECT u.name,u.email,u.code FROM friend_requests fr JOIN users u ON u.id=fr.sender_id WHERE fr.receiver_id=$1 AND fr.status='pending' ORDER BY fr.created_at DESC`,[u.id]);r.json({friends:f.rows.map(u2=>({...pub(u2),online:onlineByCode.has(u2.code)})),requests:reqs.rows.map(pub)})}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar amigos."})}});
 app.post("/api/friends/request",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Usuário não encontrado."});if(x.id===u.id)return r.status(400).json({error:"Você não pode adicionar a si mesmo."});const exists=await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[u.id,x.id]);if(exists.rowCount)return r.status(400).json({error:"Vocês já são amigos."});const reverse=await pool.query("SELECT 1 FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(reverse.rowCount)return r.status(400).json({error:"Esse usuário já enviou uma solicitação para você."});await pool.query("INSERT INTO friend_requests(sender_id,receiver_id,status) VALUES($1,$2,'pending') ON CONFLICT(sender_id,receiver_id) DO UPDATE SET status='pending'",[u.id,x.id]);notifyUser(x.code,"friend-request",{name:u.name,code:u.code});r.json({message:"Solicitação enviada."})}catch(e){console.error(e);r.status(500).json({error:"Erro ao enviar solicitação."})}});
@@ -372,4 +422,4 @@ io.on("connection",s=>{
  s.on("disconnect",()=>{const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
-initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.3.0 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.3.1 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
