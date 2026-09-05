@@ -7,6 +7,8 @@ function allowOrigin(origin){
   if(configuredOrigins.length===0||configuredOrigins.includes("*")||configuredOrigins.includes(origin))return true;
   if(origin==="https://freechat-ten.vercel.app")return true;
   if(/^https:\/\/[a-z0-9-]+(?:-[a-z0-9-]+)*\.vercel\.app$/i.test(origin))return true;
+  if(/^https:\/\/[a-z0-9-]+(?:-[a-z0-9-]+)*\.netlify\.app$/i.test(origin))return true;
+  if(/^http:\/\/(localhost|127\.0\.0\.1)(?::\d+)?$/i.test(origin))return true;
   return false;
 }
 const corsOptions={origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST","OPTIONS"],credentials:false};
@@ -620,4 +622,4 @@ io.on("connection",s=>{
 const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
-initDb().then(()=>server.listen(Number(process.env.PORT)||3000,"0.0.0.0",()=>console.log("Conversa Live v3.0.4 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+initDb().then(()=>server.listen(Number(process.env.PORT)||3000,"0.0.0.0",()=>console.log("Conversa Live v3.0.5 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
