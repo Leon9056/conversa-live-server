@@ -24,6 +24,10 @@ function notifyUser(code,event,payload){
   for(const sid of set)io.to(sid).emit(event,payload);
   return true;
 }
+async function addNotification(userId,type,title,body,data={}){
+ try{const x=await pool.query("INSERT INTO notifications(user_id,type,title,body,data) VALUES($1,$2,$3,$4,$5) RETURNING id,type,title,body,data,created_at",[userId,type,title,String(body||"").slice(0,500),JSON.stringify(data||{})]);notifyUser((await getUserById(userId))?.code,"notification-new",x.rows[0]);return x.rows[0]}catch(e){console.error("notification",e);return null}
+}
+async function getUserById(id){const x=await pool.query("SELECT id,name,email,code FROM users WHERE id=$1 LIMIT 1",[id]);return x.rows[0]||null}
 const SESSION_TTL_MS=7*24*60*60*1000;
 function rateLimit(key,limit,windowMs){
   const now=Date.now(), old=rateLimits.get(key)||[];
@@ -53,6 +57,19 @@ async function initDb(){
  friend_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  created_at TIMESTAMPTZ DEFAULT NOW(),UNIQUE(user_id,friend_id)
  )`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS social_posts(
+   id BIGSERIAL PRIMARY KEY, author_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   body VARCHAR(1000) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ )`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS social_likes(
+   post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(post_id,user_id)
+ )`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS notifications(
+   id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   type VARCHAR(32) NOT NULL, title VARCHAR(120) NOT NULL, body VARCHAR(500), data JSONB, read_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ )`);
+ await pool.query("CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications(user_id,created_at DESC)");
  await pool.query(`CREATE TABLE IF NOT EXISTS direct_messages(
    id BIGSERIAL PRIMARY KEY,
    sender_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -159,12 +176,19 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.3.1 PostgreSQL + música"));
-app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.3.1"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.3.1"})}});
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v2.4.0 PostgreSQL + música"));
+app.get("/health",async(_,r)=>{try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"2.4.0"})}catch(e){r.status(503).json({ok:false,database:false,version:"2.4.0"})}});
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
 // Credentials stay on the server. Configure AUDIUS_API_KEY and/or
 // AUDIUS_BEARER_TOKEN in Render when required by the Audius API plan.
+app.get("/api/me",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;r.json({user:pub(u)})}catch(e){r.status(500).json({error:"Erro ao carregar perfil."})}});
+app.patch("/api/me",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const name=cleanName(q.body?.name);if(name.length<2)return r.status(400).json({error:"O nome precisa ter pelo menos 2 caracteres."});await pool.query("UPDATE users SET name=$1 WHERE id=$2",[name,u.id]);const updated=await getUserById(u.id);r.json({user:pub(updated)})}catch(e){console.error(e);r.status(500).json({error:"Não foi possível salvar o perfil."})}});
+app.get("/api/feed",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const limit=Math.min(Math.max(Number(q.query.limit)||30,1),50);const x=await pool.query(`SELECT p.id,p.body,p.created_at,u.id AS author_id,u.name,u.code,COUNT(l.post_id)::int AS likes,BOOL_OR(l.user_id=$1) AS liked FROM social_posts p JOIN users u ON u.id=p.author_id LEFT JOIN social_likes l ON l.post_id=p.id WHERE p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1) GROUP BY p.id,u.id ORDER BY p.created_at DESC LIMIT $2`,[u.id,limit]);r.json({posts:x.rows.map(p=>({...p,liked:!!p.liked}))})}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar o feed."})}});
+app.post("/api/feed",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const body=String(q.body?.body||"").trim();if(body.length<1)return r.status(400).json({error:"Escreva algo antes de publicar."});if(body.length>1000)return r.status(400).json({error:"A publicação pode ter no máximo 1000 caracteres."});const x=await pool.query("INSERT INTO social_posts(author_id,body) VALUES($1,$2) RETURNING id,body,created_at",[u.id,body]);r.json({post:{...x.rows[0],author_id:u.id,name:u.name,code:u.code,likes:0,liked:false}})}catch(e){console.error(e);r.status(500).json({error:"Não foi possível publicar."})}});
+app.post("/api/feed/:id/like",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);const exists=await pool.query("SELECT 1 FROM social_likes WHERE post_id=$1 AND user_id=$2",[id,u.id]);let liked;if(exists.rowCount){await pool.query("DELETE FROM social_likes WHERE post_id=$1 AND user_id=$2",[id,u.id]);liked=false}else{await pool.query("INSERT INTO social_likes(post_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[id,u.id]);liked=true}const c=await pool.query("SELECT COUNT(*)::int AS likes FROM social_likes WHERE post_id=$1",[id]);r.json({liked,likes:c.rows[0].likes})}catch(e){r.status(500).json({error:"Não foi possível reagir."})}});
+app.get("/api/notifications",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const x=await pool.query("SELECT id,type,title,body,data,read_at,created_at FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50",[u.id]);const unread=x.rows.filter(n=>!n.read_at).length;r.json({notifications:x.rows,unread})}catch(e){r.status(500).json({error:"Erro ao carregar notificações."})}});
+app.post("/api/notifications/read",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;await pool.query("UPDATE notifications SET read_at=NOW() WHERE user_id=$1 AND read_at IS NULL",[u.id]);r.json({ok:true})}catch(e){r.status(500).json({error:"Erro ao marcar notificações."})}});
 app.get("/api/music/search",async(q,r)=>{
   try{
     const me=await auth(q,r);if(!me)return;
@@ -313,7 +337,7 @@ app.post("/api/messages",async(q,r)=>{
   if(!rateLimit("dm:"+me.id,40,60*1000))return r.status(429).json({error:"Muitas mensagens em pouco tempo. Aguarde um instante."});
   const {other,error,status}=await getFriendForDM(me,code);if(error)return r.status(status).json({error});
   const x=await pool.query("INSERT INTO direct_messages(sender_id,receiver_id,body) VALUES($1,$2,$3) RETURNING id,sender_id,receiver_id,body,created_at,read_at",[me.id,other.id,body]);
-  const message=messagePublic(x.rows[0],me.id);notifyUser(other.code,"dm-new",{code:me.code,fromName:me.name,message});
+  const message=messagePublic(x.rows[0],me.id);notifyUser(other.code,"dm-new",{code:me.code,fromName:me.name,message}); await addNotification(other.id,"message","Nova mensagem",me.name+" enviou uma mensagem.",{code:me.code});
   r.json({message});
  }catch(e){console.error(e);r.status(500).json({error:"Não foi possível enviar a mensagem."})}
 });
@@ -329,12 +353,12 @@ app.post("/api/messages/media",(req,res,next)=>{upload.single("file")(req,res,er
   const kind=q.file.mimetype.startsWith("image/")?"image":"video";
   const x=await pool.query(`INSERT INTO direct_messages(sender_id,receiver_id,body,media_type,media_name,media_mime,media_size,media_data) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,sender_id,receiver_id,body,created_at,read_at`,[me.id,other.id,caption||null,kind,String(q.file.originalname||"media").slice(0,180),q.file.mimetype,q.file.size,q.file.buffer]);
   const row=await pool.query("SELECT CASE WHEN media_data IS NOT NULL THEN id END AS media_id,media_type,media_name,media_mime,media_size FROM direct_messages WHERE id=$1",[x.rows[0].id]);
-  const message=messagePublic({...x.rows[0],...row.rows[0]},me.id);notifyUser(other.code,"dm-new",{code:me.code,fromName:me.name,message});r.json({message});
+  const message=messagePublic({...x.rows[0],...row.rows[0]},me.id);notifyUser(other.code,"dm-new",{code:me.code,fromName:me.name,message}); await addNotification(other.id,"message","Nova mensagem",me.name+" enviou uma mensagem.",{code:me.code});r.json({message});
  }catch(e){console.error("message-media-upload",e);r.status(500).json({error:"Não foi possível enviar o arquivo."})}
 });
 app.get("/api/friends",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const f=await pool.query(`SELECT u.name,u.email,u.code FROM friendships f JOIN users u ON u.id=f.friend_id WHERE f.user_id=$1 ORDER BY u.name`,[u.id]);const reqs=await pool.query(`SELECT u.name,u.email,u.code FROM friend_requests fr JOIN users u ON u.id=fr.sender_id WHERE fr.receiver_id=$1 AND fr.status='pending' ORDER BY fr.created_at DESC`,[u.id]);r.json({friends:f.rows.map(u2=>({...pub(u2),online:onlineByCode.has(u2.code)})),requests:reqs.rows.map(pub)})}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar amigos."})}});
-app.post("/api/friends/request",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Usuário não encontrado."});if(x.id===u.id)return r.status(400).json({error:"Você não pode adicionar a si mesmo."});const exists=await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[u.id,x.id]);if(exists.rowCount)return r.status(400).json({error:"Vocês já são amigos."});const reverse=await pool.query("SELECT 1 FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(reverse.rowCount)return r.status(400).json({error:"Esse usuário já enviou uma solicitação para você."});await pool.query("INSERT INTO friend_requests(sender_id,receiver_id,status) VALUES($1,$2,'pending') ON CONFLICT(sender_id,receiver_id) DO UPDATE SET status='pending'",[u.id,x.id]);notifyUser(x.code,"friend-request",{name:u.name,code:u.code});r.json({message:"Solicitação enviada."})}catch(e){console.error(e);r.status(500).json({error:"Erro ao enviar solicitação."})}});
-app.post("/api/friends/accept",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Solicitação não encontrada."});const a=await pool.query("SELECT id FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(!a.rowCount)return r.status(404).json({error:"Solicitação não encontrada."});const client=await pool.connect();try{await client.query("BEGIN");await client.query("UPDATE friend_requests SET status='accepted' WHERE id=$1",[a.rows[0].id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,x.id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[x.id,u.id]);await client.query("COMMIT")}catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}notifyUser(x.code,"friend-accepted",{name:u.name,code:u.code});r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao aceitar solicitação."})}});
+app.post("/api/friends/request",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Usuário não encontrado."});if(x.id===u.id)return r.status(400).json({error:"Você não pode adicionar a si mesmo."});const exists=await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[u.id,x.id]);if(exists.rowCount)return r.status(400).json({error:"Vocês já são amigos."});const reverse=await pool.query("SELECT 1 FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(reverse.rowCount)return r.status(400).json({error:"Esse usuário já enviou uma solicitação para você."});await pool.query("INSERT INTO friend_requests(sender_id,receiver_id,status) VALUES($1,$2,'pending') ON CONFLICT(sender_id,receiver_id) DO UPDATE SET status='pending'",[u.id,x.id]);notifyUser(x.code,"friend-request",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Novo convite de amizade",u.name+" quer ser seu amigo.",{code:u.code});r.json({message:"Solicitação enviada."})}catch(e){console.error(e);r.status(500).json({error:"Erro ao enviar solicitação."})}});
+app.post("/api/friends/accept",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Solicitação não encontrada."});const a=await pool.query("SELECT id FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(!a.rowCount)return r.status(404).json({error:"Solicitação não encontrada."});const client=await pool.connect();try{await client.query("BEGIN");await client.query("UPDATE friend_requests SET status='accepted' WHERE id=$1",[a.rows[0].id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,x.id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[x.id,u.id]);await client.query("COMMIT")}catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}notifyUser(x.code,"friend-accepted",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Convite aceito",u.name+" aceitou seu convite.",{code:u.code});r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao aceitar solicitação."})}});
 app.post("/api/friends/reject",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Solicitação não encontrada."});const a=await pool.query("DELETE FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(!a.rowCount)return r.status(404).json({error:"Solicitação não encontrada."});r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao recusar solicitação."})}});
 app.post("/api/friends/remove",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").toUpperCase(),x=await getUserByCode(c);if(x){await pool.query("DELETE FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1)",[u.id,x.id])}r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao remover amigo."})}});
 function userList(room){const x=rooms.get(room);return x?[...x.values()].map(v=>({id:v.id,name:v.name,code:v.code,host:v.id===calls.get(room)})):[]}
@@ -422,4 +446,4 @@ io.on("connection",s=>{
  s.on("disconnect",()=>{const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
-initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.3.1 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
+initDb().then(()=>server.listen(process.env.PORT||3000,()=>console.log("Conversa Live v2.4.0 server ativo com PostgreSQL + mensagens diretas em tempo real + music bot otimizado + convites de call"))).catch(e=>{console.error("Falha ao iniciar banco:",e);process.exit(1)});
