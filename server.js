@@ -147,6 +147,33 @@ async function initDb(){
  await pool.query(`CREATE TABLE IF NOT EXISTS blocked_users(user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,blocked_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(user_id,blocked_id))`);
  await pool.query(`CREATE TABLE IF NOT EXISTS reports(id BIGSERIAL PRIMARY KEY,reporter_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,target_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,reason VARCHAR(64) NOT NULL,details VARCHAR(1000),status VARCHAR(16) NOT NULL DEFAULT 'open',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
  await pool.query(`CREATE TABLE IF NOT EXISTS user_privacy(user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,message_policy VARCHAR(16) NOT NULL DEFAULT 'friends',call_policy VARCHAR(16) NOT NULL DEFAULT 'friends',friend_policy VARCHAR(16) NOT NULL DEFAULT 'everyone')`);
+
+ await pool.query(`CREATE TABLE IF NOT EXISTS communities(
+   id BIGSERIAL PRIMARY KEY,
+   owner_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   name VARCHAR(48) NOT NULL,
+   description VARCHAR(180) NOT NULL DEFAULT '',
+   is_public BOOLEAN NOT NULL DEFAULT TRUE,
+   invite_code VARCHAR(16) UNIQUE NOT NULL,
+   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ )`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS community_members(
+   community_id BIGINT NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   role VARCHAR(16) NOT NULL DEFAULT 'member',
+   joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+   PRIMARY KEY(community_id,user_id)
+ )`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS community_channels(
+   id BIGSERIAL PRIMARY KEY,
+   community_id BIGINT NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+   name VARCHAR(48) NOT NULL,
+   type VARCHAR(8) NOT NULL DEFAULT 'text',
+   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ )`);
+ await pool.query("CREATE INDEX IF NOT EXISTS community_members_user_idx ON community_members(user_id)");
+ await pool.query("CREATE INDEX IF NOT EXISTS community_channels_community_idx ON community_channels(community_id,id)");
+
 }
 
 function cleanName(value){
@@ -247,11 +274,136 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("FreeChat server OK — v1.1.0 PostgreSQL + música"));
+
+function cleanCommunityName(v){return String(v??"").replace(/\s+/g," ").trim().slice(0,48)}
+function cleanCommunityDesc(v){return String(v??"").replace(/\s+/g," ").trim().slice(0,180)}
+function communityCode(){const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";let out="FR-";for(let i=0;i<8;i++)out+=chars[crypto.randomInt(chars.length)];return out}
+async function isCommunityMember(userId,communityId){
+ const x=await pool.query("SELECT role FROM community_members WHERE community_id=$1 AND user_id=$2 LIMIT 1",[communityId,userId]);
+ return x.rows[0]||null;
+}
+async function communitySummary(row,userId){
+ return {id:Number(row.id),name:row.name,description:row.description||"",is_public:!!row.is_public,invite_code:Number(row.owner_id)===Number(userId)?row.invite_code:null,owner_id:Number(row.owner_id),member_count:Number(row.member_count||0),joined:!!row.joined,role:row.role||null};
+}
+app.get("/api/servers",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const mine=await pool.query(`SELECT c.*,COUNT(cm2.user_id)::int AS member_count,EXISTS(SELECT 1 FROM community_members cm WHERE cm.community_id=c.id AND cm.user_id=$1) AS joined,
+   (SELECT role FROM community_members cm3 WHERE cm3.community_id=c.id AND cm3.user_id=$1 LIMIT 1) AS role
+   FROM communities c LEFT JOIN community_members cm2 ON cm2.community_id=c.id
+   WHERE EXISTS(SELECT 1 FROM community_members cm4 WHERE cm4.community_id=c.id AND cm4.user_id=$1)
+   GROUP BY c.id ORDER BY c.created_at DESC LIMIT 100`,[u.id]);
+ const discover=await pool.query(`SELECT c.*,COUNT(cm2.user_id)::int AS member_count,FALSE AS joined,NULL::text AS role
+   FROM communities c LEFT JOIN community_members cm2 ON cm2.community_id=c.id
+   WHERE c.is_public=TRUE AND NOT EXISTS(SELECT 1 FROM community_members cm WHERE cm.community_id=c.id AND cm.user_id=$1)
+   GROUP BY c.id ORDER BY c.created_at DESC LIMIT 50`,[u.id]);
+ r.json({mine:mine.rows.map(x=>communitySummary(x,u.id)),discover:discover.rows.map(x=>communitySummary(x,u.id))});
+}catch(e){console.error("servers-list",e);r.status(500).json({error:"Não foi possível carregar os servidores."})}});
+
+app.post("/api/servers",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ if(!rateLimit("server-create:"+u.id,5,10*60*1000))return r.status(429).json({error:"Você criou muitos servidores recentemente. Aguarde."});
+ const name=cleanCommunityName(q.body?.name),description=cleanCommunityDesc(q.body?.description),isPublic=q.body?.isPublic!==false;
+ if(name.length<2)return r.status(400).json({error:"O nome do servidor precisa ter pelo menos 2 caracteres."});
+ let created=null;
+ for(let i=0;i<5&&!created;i++){const invite=communityCode();try{
+   const x=await pool.query("INSERT INTO communities(owner_id,name,description,is_public,invite_code) VALUES($1,$2,$3,$4,$5) RETURNING *",[u.id,name,description,isPublic,invite]);
+   created=x.rows[0];
+ }catch(e){if(e?.code!=="23505")throw e;}}
+ if(!created)return r.status(500).json({error:"Não foi possível gerar o convite do servidor."});
+ await pool.query("INSERT INTO community_members(community_id,user_id,role) VALUES($1,$2,'owner')",[created.id,u.id]);
+ await pool.query("INSERT INTO community_channels(community_id,name,type) VALUES($1,'geral','text'),($1,'Sala de voz','voice')",[created.id]);
+ await securityEvent(u.id,"COMMUNITY_CREATED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{communityId:created.id}});
+ r.json({server:{id:Number(created.id),name:created.name,description:created.description,is_public:created.is_public,invite_code:created.invite_code}});
+}catch(e){console.error("server-create",e);r.status(500).json({error:"Não foi possível criar o servidor."})}});
+
+app.post("/api/servers/join",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const invite=String(q.body?.inviteCode||"").trim().toUpperCase().slice(0,16);
+ if(!/^FR-[A-Z0-9]{8}$/.test(invite))return r.status(400).json({error:"Código de convite inválido."});
+ const x=await pool.query("SELECT id,name FROM communities WHERE invite_code=$1 LIMIT 1",[invite]);if(!x.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
+ await pool.query("INSERT INTO community_members(community_id,user_id,role) VALUES($1,$2,'member') ON CONFLICT DO NOTHING",[x.rows[0].id,u.id]);
+ r.json({server:{id:Number(x.rows[0].id),name:x.rows[0].name}});
+}catch(e){console.error("server-join",e);r.status(500).json({error:"Não foi possível entrar no servidor."})}});
+
+app.post("/api/servers/:id/join",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Servidor inválido."});
+ const x=await pool.query("SELECT id,name,is_public FROM communities WHERE id=$1 LIMIT 1",[id]);if(!x.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
+ if(!x.rows[0].is_public){
+   return r.status(403).json({error:"Este servidor é privado. Use um código de convite."});
+ }
+ await pool.query("INSERT INTO community_members(community_id,user_id,role) VALUES($1,$2,'member') ON CONFLICT DO NOTHING",[id,u.id]);
+ r.json({ok:true,server:{id,name:x.rows[0].name}});
+}catch(e){console.error("server-join-id",e);r.status(500).json({error:"Não foi possível entrar no servidor."})}});
+
+app.get("/api/servers/:id",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Servidor inválido."});
+ const member=await isCommunityMember(u.id,id);if(!member)return r.status(403).json({error:"Você não participa deste servidor."});
+ const s=await pool.query("SELECT id,owner_id,name,description,is_public,invite_code FROM communities WHERE id=$1 LIMIT 1",[id]);if(!s.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
+ const ch=await pool.query("SELECT id,name,type FROM community_channels WHERE community_id=$1 ORDER BY id",[id]);
+ const channels=ch.rows.map(c=>({id:Number(c.id),name:c.name,type:c.type,room_name:`srv-${id}-${c.id}`}));
+ r.json({server:{id:Number(s.rows[0].id),owner_id:Number(s.rows[0].owner_id),name:s.rows[0].name,description:s.rows[0].description||"",is_public:!!s.rows[0].is_public,invite_code:Number(s.rows[0].owner_id)===Number(u.id)?s.rows[0].invite_code:null,role:member.role,channels}});
+}catch(e){console.error("server-detail",e);r.status(500).json({error:"Não foi possível carregar o servidor."})}});
+
+app.post("/api/servers/:id/channels",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const id=Number(q.params.id),member=await isCommunityMember(u.id,id);if(!member||!["owner","admin"].includes(member.role))return r.status(403).json({error:"Você não tem permissão para criar canais."});
+ const name=cleanCommunityName(q.body?.name),type=String(q.body?.type||"text");if(name.length<1||!["text","voice"].includes(type))return r.status(400).json({error:"Canal inválido."});
+ const x=await pool.query("INSERT INTO community_channels(community_id,name,type) VALUES($1,$2,$3) RETURNING id,name,type",[id,name,type]);
+ r.json({channel:{id:Number(x.rows[0].id),name:x.rows[0].name,type:x.rows[0].type,room_name:`srv-${id}-${x.rows[0].id}`}});
+}catch(e){console.error("channel-create",e);r.status(500).json({error:"Não foi possível criar o canal."})}});
+
+/* Random matchmaking: processo local do servidor; sem serviço externo. */
+const randomQueue=new Map();
+const randomMatches=new Map();
+function randomRoomId(){return "random-"+crypto.randomBytes(8).toString("hex")}
+function clearRandomForUser(userId){
+ const uid=Number(userId);randomQueue.delete(uid);
+ for(const [mid,m] of randomMatches){if(Number(m.a.userId)===uid||Number(m.b.userId)===uid)randomMatches.delete(mid)}
+}
+async function findRandomMatch(userId){
+ const me=await getUserById(userId);if(!me)return null;
+ const blocked=await pool.query("SELECT blocked_id FROM blocked_users WHERE user_id=$1",[userId]);
+ const blockedSet=new Set(blocked.rows.map(x=>String(x.blocked_id)));
+ const candidates=[...randomQueue.entries()].filter(([id,v])=>Number(id)!==Number(userId)&&Date.now()-v.joinedAt<10*60*1000&&!blockedSet.has(String(id)));
+ for(const [otherId,other] of candidates.sort(()=>Math.random()-.5)){
+   const rev=await pool.query("SELECT 1 FROM blocked_users WHERE user_id=$1 AND blocked_id=$2 LIMIT 1",[otherId,userId]);
+   if(rev.rowCount)continue;
+   randomQueue.delete(Number(otherId));randomQueue.delete(Number(userId));
+   const matchId=crypto.randomBytes(8).toString("hex"),room=randomRoomId();
+   const partnerOther={userId:Number(otherId),code:other.code,name:other.name,avatarUrl:avatarUrlFor(other)};
+   const partnerMe={userId:Number(userId),code:me.code,name:me.name,avatarUrl:avatarUrlFor(me)};
+   const match={a:partnerMe,b:partnerOther,room,matchId,createdAt:Date.now()};
+   randomMatches.set(matchId,match);
+   notifyUser(me.code,"random-match-found",{matchId,room,partner:partnerOther});
+   notifyUser(other.code,"random-match-found",{matchId,room,partner:partnerMe});
+   return {matchId,room,partner:partnerOther};
+ }
+ return null;
+}
+app.post("/api/random/queue",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ if(!rateLimit("random:"+u.id,20,60*1000))return r.status(429).json({error:"Muitas tentativas de conexão. Aguarde um pouco."});
+ const p=await privacyFor(u.id);
+ if(!p.random_enabled)return r.status(403).json({error:"Ative Conhecer alguém nas configurações de privacidade antes de entrar na fila."});
+ if(p.call_policy==="nobody")return r.status(403).json({error:"Suas configurações de chamadas não permitem essa função."});
+ clearRandomForUser(u.id);
+ const match=await findRandomMatch(u.id);
+ if(match)return r.json({ok:true,match:{matchId:match.matchId,room:match.room,...match.partner}});
+ randomQueue.set(Number(u.id),{code:u.code,name:u.name,avatarUrl:avatarUrlFor(u),joinedAt:Date.now()});
+ r.json({ok:true,waiting:true});
+}catch(e){console.error("random-queue",e);r.status(500).json({error:"Não foi possível entrar na fila."})}});
+
+app.post("/api/random/leave",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;clearRandomForUser(u.id);r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível cancelar a fila."})}});
+
+app.post("/api/random/next",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;clearRandomForUser(u.id);const match=await findRandomMatch(u.id);if(match)return r.json({ok:true,match:{matchId:match.matchId,room:match.room,...match.partner}});randomQueue.set(Number(u.id),{code:u.code,name:u.name,avatarUrl:avatarUrlFor(u),joinedAt:Date.now()});r.json({ok:true,waiting:true})}catch(e){r.status(500).json({error:"Não foi possível procurar outra pessoa."})}});
+
+app.get("/",(_,r)=>r.send("FreeChat server OK — v1.2.0 PostgreSQL + música"));
 app.get("/health",async(_,r)=>{
-  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"1.1.0",service:"conversa-live-server"});
-  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.1.0",service:"conversa-live-server"})}
-  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"1.1.0",service:"conversa-live-server"})}
+  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"1.2.0",service:"conversa-live-server"});
+  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.2.0",service:"conversa-live-server"})}
+  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"1.2.0",service:"conversa-live-server"})}
 });
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
@@ -343,6 +495,16 @@ app.post("/api/feed/:id/like",async(q,r)=>{try{
  if(liked&&Number(authorId)!==Number(u.id))await addNotification(authorId,"social","Nova curtida",u.name+" curtiu sua publicação.",{postId:id});
  r.json({liked,likes:Number(c.rows[0].likes||0)});
 }catch(e){console.error(e);r.status(500).json({error:"Não foi possível atualizar a curtida."})}});
+
+app.delete("/api/feed/:id",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const id=Number(q.params.id);
+ if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
+ if(!rateLimit("feed-delete:"+u.id,30,60*1000))return r.status(429).json({error:"Muitas exclusões em pouco tempo. Aguarde um instante."});
+ const x=await pool.query("DELETE FROM social_posts WHERE id=$1 AND author_id=$2 RETURNING id",[id,u.id]);
+ if(!x.rowCount)return r.status(404).json({error:"Publicação não encontrada ou você não é o autor."});
+ r.json({ok:true,id});
+}catch(e){console.error("feed-delete",e);r.status(500).json({error:"Não foi possível excluir a publicação."})}});
 
 app.get("/api/feed/:id/comments",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
@@ -618,12 +780,21 @@ app.post("/api/messages/media",(req,res,next)=>{upload.single("file")(req,res,er
   const message=messagePublic({...x.rows[0],...row.rows[0]},me.id);notifyUser(other.code,"dm-new",{code:me.code,fromName:me.name,message}); await addNotification(other.id,"message","Nova mensagem",me.name+" enviou uma mensagem.",{code:me.code});r.json({message});
  }catch(e){console.error("message-media-upload",e);r.status(500).json({error:"Não foi possível enviar o arquivo."})}
 });
-async function privacyFor(userId){const x=await pool.query("SELECT message_policy,call_policy,friend_policy FROM user_privacy WHERE user_id=$1",[userId]);if(x.rowCount)return x.rows[0];await pool.query("INSERT INTO user_privacy(user_id) VALUES($1) ON CONFLICT DO NOTHING",[userId]);return {message_policy:"friends",call_policy:"friends",friend_policy:"everyone"}}
+async function privacyFor(userId){const x=await pool.query("SELECT message_policy,call_policy,friend_policy,random_enabled FROM user_privacy WHERE user_id=$1",[userId]);if(x.rowCount)return x.rows[0];await pool.query("INSERT INTO user_privacy(user_id) VALUES($1) ON CONFLICT DO NOTHING",[userId]);return {message_policy:"friends",call_policy:"friends",friend_policy:"everyone",random_enabled:false}}
 async function areFriends(a,b){return (await pool.query("SELECT 1 FROM friendships WHERE (user_id=$1 AND friend_id=$2) LIMIT 1",[a,b])).rowCount>0}
 async function isBlocked(a,b){return (await pool.query("SELECT 1 FROM blocked_users WHERE (user_id=$1 AND blocked_id=$2) OR (user_id=$2 AND blocked_id=$1) LIMIT 1",[a,b])).rowCount>0}
 async function canContact(targetId,meId,policy){if(await isBlocked(targetId,meId))return false;if(policy==="everyone")return true;if(policy==="nobody")return false;return areFriends(targetId,meId)}
 app.get("/api/security/privacy",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;r.json(await privacyFor(u.id))}catch(e){r.status(500).json({error:"Não foi possível carregar a privacidade."})}});
-app.patch("/api/security/privacy",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const allowed=["everyone","friends","nobody"];const m=String(q.body?.message_policy||"friends"),c=String(q.body?.call_policy||"friends"),f=String(q.body?.friend_policy||"everyone");if(!allowed.includes(m)||!allowed.includes(c)||!allowed.includes(f))return r.status(400).json({error:"Configuração de privacidade inválida."});await pool.query("INSERT INTO user_privacy(user_id,message_policy,call_policy,friend_policy) VALUES($1,$2,$3,$4) ON CONFLICT(user_id) DO UPDATE SET message_policy=EXCLUDED.message_policy,call_policy=EXCLUDED.call_policy,friend_policy=EXCLUDED.friend_policy",[u.id,m,c,f]);await securityEvent(u.id,"PRIVACY_UPDATED",{ip:requestIp(q),ua:q.headers["user-agent"]});r.json({message_policy:m,call_policy:c,friend_policy:f})}catch(e){r.status(500).json({error:"Não foi possível salvar a privacidade."})}});
+app.patch("/api/security/privacy",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const allowed=["everyone","friends","nobody"];
+ const m=String(q.body?.message_policy||"friends"),c=String(q.body?.call_policy||"friends"),f=String(q.body?.friend_policy||"everyone");
+ const randomEnabled=q.body?.random_enabled===true;
+ if(!allowed.includes(m)||!allowed.includes(c)||!allowed.includes(f))return r.status(400).json({error:"Configuração de privacidade inválida."});
+ await pool.query("INSERT INTO user_privacy(user_id,message_policy,call_policy,friend_policy,random_enabled) VALUES($1,$2,$3,$4,$5) ON CONFLICT(user_id) DO UPDATE SET message_policy=EXCLUDED.message_policy,call_policy=EXCLUDED.call_policy,friend_policy=EXCLUDED.friend_policy,random_enabled=EXCLUDED.random_enabled",[u.id,m,c,f,randomEnabled]);
+ await securityEvent(u.id,"PRIVACY_UPDATED",{ip:requestIp(q),ua:q.headers["user-agent"]});
+ r.json({message_policy:m,call_policy:c,friend_policy:f,random_enabled:randomEnabled});
+}catch(e){r.status(500).json({error:"Não foi possível salvar a privacidade."})}});
 
 app.get("/api/security/blocked",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const x=await pool.query("SELECT u.name,u.code FROM blocked_users b JOIN users u ON u.id=b.blocked_id WHERE b.user_id=$1 ORDER BY b.created_at DESC",[u.id]);r.json({blocked:x.rows})}catch(e){r.status(500).json({error:"Não foi possível carregar bloqueios."})}});
 app.post("/api/security/block",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const target=await getUserByCode(q.body?.code);if(!target||Number(target.id)===Number(u.id))return r.status(400).json({error:"Usuário inválido."});await pool.query("INSERT INTO blocked_users(user_id,blocked_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,target.id]);await securityEvent(u.id,"USER_BLOCKED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{target:target.code}});r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível bloquear."})}});
@@ -656,8 +827,21 @@ io.on("connection",s=>{
    onlineByCode.get(meCode).add(s.id);
  }
  s.on("client-ping",t=>s.emit("client-pong",t));
- s.on("join",({room})=>{const u=s.data.user;if(!u)return;s.data.room=String(room||"geral").replace(/[^a-zA-Z0-9_-]/g,"").slice(0,32)||"geral";s.data.name=u.name;s.data.code=u.code;const rm=s.data.room;if(!rooms.has(rm))rooms.set(rm,new Map());rooms.get(rm).set(s.id,{id:s.id,name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)});s.join(rm);s.emit("room-users",userList(rm));s.to(rm).emit("user-joined",{id:s.id,name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)});if(calls.has(rm)){const h=calls.get(rm);s.emit("call-host",h);s.emit("call-state",{active:true,host:h,ready:[...ready(rm)]})}else s.emit("call-state",{active:false,host:null,ready:[]});if(roomMusic.has(rm))s.emit("music-state",musicStateFor(rm));});
- s.on("chat",({room,text})=>{if(room!==s.data.room)return;const t=String(text||"").trim().slice(0,1000);if(t)io.to(room).emit("chat",{name:s.data.name,text:t,time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})})});
+ s.on("join",async({room}={})=>{const u=s.data.user;if(!u)return;
+   const requested=String(room||"geral").replace(/[^a-zA-Z0-9_-]/g,"").slice(0,48)||"geral";
+   if(requested.startsWith("srv-")){
+     const m=requested.match(/^srv-(\d+)-(\d+)$/);
+     if(!m||!(await (async()=>{const c=await pool.query("SELECT community_id FROM community_channels WHERE id=$1 LIMIT 1",[Number(m[2])]);return c.rowCount&&Number(c.rows[0].community_id)===Number(m[1])&&(await isCommunityMember(u.id,Number(m[1])))} )())){s.emit("system","Você não tem acesso a este canal.");return;}
+   }
+   s.data.room=requested;s.data.name=u.name;s.data.code=u.code;const rm=s.data.room;if(!rooms.has(rm))rooms.set(rm,new Map());rooms.get(rm).set(s.id,{id:s.id,name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)});s.join(rm);s.emit("room-users",userList(rm));s.to(rm).emit("user-joined",{id:s.id,name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)});if(calls.has(rm)){const h=calls.get(rm);s.emit("call-host",h);s.emit("call-state",{active:true,host:h,ready:[...ready(rm)]})}else s.emit("call-state",{active:false,host:null,ready:[]});if(roomMusic.has(rm))s.emit("music-state",musicStateFor(rm));});
+ s.on("chat",({room,text}={})=>{
+   if(room!==s.data.room)return;
+   if(!rateLimit("socket-chat:"+s.data.user.id,60,60*1000)){s.emit("system","Muitas mensagens em pouco tempo. Aguarde.");return;}
+   const t=String(text||"").trim().slice(0,1000);
+   if(t){
+     io.to(room).emit("chat",{name:s.data.name,text:t,time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})});
+   }
+ });
  s.on("profile-updated",({avatarUrl,name})=>{
    const u=s.data.user;if(!u)return;
    if(typeof name==="string"&&name.trim())u.name=name.trim().slice(0,24);
@@ -761,12 +945,22 @@ io.on("connection",s=>{
  s.on("disconnect",()=>{
    pendingSignals.delete(s.id);
    for(const [target,q] of pendingSignals){const filtered=q.filter(x=>x.from!==s.id);if(filtered.length)pendingSignals.set(target,filtered);else pendingSignals.delete(target);}
-const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
+const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}
+ try{clearRandomForUser(s.data.user?.id);}catch(e){console.error("disconnect-random-cleanup",e);}
+ const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
-setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
+setInterval(async()=>{
+ const now=Date.now();
+ for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);
+ for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);
+ for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);
+ for(const [id,v] of randomQueue)if(now-v.joinedAt>10*60*1000)randomQueue.delete(id);
+ for(const [mid,m] of randomMatches)if(now-m.createdAt>30*60*1000)randomMatches.delete(mid);
+ try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}
+},30*60*1000);
 const PORT=Number(process.env.PORT)||3000;
 server.listen(PORT,"0.0.0.0",()=>{
-  console.log("FreeChat v1.1.0 server ativo na porta "+PORT);
+  console.log("FreeChat v1.2.0 server ativo na porta "+PORT);
   initDbWithRetry();
 });
 async function initDbWithRetry(){
