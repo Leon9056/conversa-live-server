@@ -38,7 +38,7 @@ function notifyUser(code,event,payload){
 async function addNotification(userId,type,title,body,data={}){
  try{const x=await pool.query("INSERT INTO notifications(user_id,type,title,body,data) VALUES($1,$2,$3,$4,$5) RETURNING id,type,title,body,data,created_at",[userId,type,title,String(body||"").slice(0,500),JSON.stringify(data||{})]);notifyUser((await getUserById(userId))?.code,"notification-new",x.rows[0]);return x.rows[0]}catch(e){console.error("notification",e);return null}
 }
-async function getUserById(id){const x=await pool.query("SELECT id,name,email,code FROM users WHERE id=$1 LIMIT 1",[id]);return x.rows[0]||null}
+async function getUserById(id){const x=await pool.query("SELECT id,name,email,code,avatar_mime,avatar_updated_at FROM users WHERE id=$1 LIMIT 1",[id]);return x.rows[0]||null}
 const SESSION_TTL_MS=7*24*60*60*1000;
 function rateLimit(key,limit,windowMs){
   const now=Date.now(), old=rateLimits.get(key)||[];
@@ -58,6 +58,9 @@ async function initDb(){
  id BIGSERIAL PRIMARY KEY,name VARCHAR(24) NOT NULL,email VARCHAR(120) UNIQUE NOT NULL,code VARCHAR(9) UNIQUE NOT NULL,
  salt TEXT NOT NULL,password_hash TEXT NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW()
  )`);
+ await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_mime VARCHAR(64)`);
+ await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data BYTEA`);
+ await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_updated_at TIMESTAMPTZ`);
  await pool.query(`CREATE TABLE IF NOT EXISTS friend_requests(
  id BIGSERIAL PRIMARY KEY,sender_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  receiver_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,status VARCHAR(12) NOT NULL DEFAULT 'pending',
@@ -164,20 +167,25 @@ function clearFailedLogin(key){failedLogins.delete(key);}
 async function securityEvent(userId,type,meta={}){try{await pool.query("INSERT INTO security_events(user_id,event_type,ip_hash,user_agent,meta) VALUES($1,$2,$3,$4,$5)",[userId||null,type,meta.ip?crypto.createHash("sha256").update(String(process.env.SESSION_SECRET||"freechat")+String(meta.ip)).digest("hex"):null,String(meta.ua||"").slice(0,300),JSON.stringify(meta.data||{})])}catch(e){console.error("security-event",e)}}
 async function getUserByEmail(email){
   const x=await pool.query(
-    "SELECT id,name,email,code,salt,password_hash,created_at FROM users WHERE email=$1 LIMIT 1",
+    "SELECT id,name,email,code,salt,password_hash,created_at,avatar_mime,avatar_updated_at FROM users WHERE email=$1 LIMIT 1",
     [cleanEmail(email)]
   );
   return x.rows[0]||null;
 }
 async function getUserByCode(value){
   const x=await pool.query(
-    "SELECT id,name,email,code,salt,password_hash,created_at FROM users WHERE code=$1 LIMIT 1",
+    "SELECT id,name,email,code,salt,password_hash,created_at,avatar_mime,avatar_updated_at FROM users WHERE code=$1 LIMIT 1",
     [String(value??"").trim().toUpperCase()]
   );
   return x.rows[0]||null;
 }
+function avatarUrlFor(u){
+  if(!u?.avatar_mime)return null;
+  const v=u.avatar_updated_at?new Date(u.avatar_updated_at).getTime():0;
+  return "/api/avatar/"+u.code+"?v="+v;
+}
 function pub(u){
-  return {id:u.id,name:u.name,email:u.email,code:u.code};
+  return {id:u.id,name:u.name,email:u.email,code:u.code,avatarUrl:avatarUrlFor(u)};
 }
 async function token(u,meta={}){
   const t=crypto.randomBytes(32).toString("base64url");
@@ -224,7 +232,7 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v3.1.0 PostgreSQL + música"));
+app.get("/",(_,r)=>r.send("FreeChat server OK — v3.1.3 PostgreSQL + música"));
 app.get("/health",async(_,r)=>{
   if(!dbReady)return r.status(503).json({ok:false,database:false,version:"3.1.0",service:"conversa-live-server"});
   try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"3.1.0",service:"conversa-live-server"})}
@@ -236,9 +244,40 @@ app.get("/health",async(_,r)=>{
 // AUDIUS_BEARER_TOKEN in Render when required by the Audius API plan.
 app.get("/api/me",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;r.json({user:pub(u)})}catch(e){r.status(500).json({error:"Erro ao carregar perfil."})}});
 app.patch("/api/me",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const name=cleanName(q.body?.name);if(name.length<2)return r.status(400).json({error:"O nome precisa ter pelo menos 2 caracteres."});await pool.query("UPDATE users SET name=$1 WHERE id=$2",[name,u.id]);const updated=await getUserById(u.id);r.json({user:pub(updated)})}catch(e){console.error(e);r.status(500).json({error:"Não foi possível salvar o perfil."})}});
+const avatarUpload=multer({storage:multer.memoryStorage(),limits:{fileSize:6*1024*1024},fileFilter:(req,file,cb)=>{const ok=/^image\/(jpeg|png|webp|gif)$/i.test(file.mimetype);cb(ok?null:new Error("Use uma imagem JPG, PNG, WEBP ou GIF."),ok)}});
+app.post("/api/me/avatar",(req,res,next)=>{avatarUpload.single("avatar")(req,res,err=>{if(err)return res.status(err.code==="LIMIT_FILE_SIZE"?413:400).json({error:err.message||"Não foi possível receber a imagem."});next()})},async(q,r)=>{
+ try{
+  const u=await auth(q,r);if(!u)return;
+  if(!q.file)return r.status(400).json({error:"Escolha uma imagem."});
+  if(!rateLimit("avatar:"+u.id,10,60*1000))return r.status(429).json({error:"Muitas trocas de foto em pouco tempo. Aguarde um instante."});
+  await pool.query("UPDATE users SET avatar_mime=$1,avatar_data=$2,avatar_updated_at=NOW() WHERE id=$3",[q.file.mimetype,q.file.buffer,u.id]);
+  const updated=await getUserById(u.id);
+  r.json({user:pub(updated)});
+ }catch(e){console.error("avatar-upload",e);r.status(500).json({error:"Não foi possível salvar a foto."})}
+});
+app.delete("/api/me/avatar",async(q,r)=>{
+ try{
+  const u=await auth(q,r);if(!u)return;
+  await pool.query("UPDATE users SET avatar_mime=NULL,avatar_data=NULL,avatar_updated_at=NULL WHERE id=$1",[u.id]);
+  const updated=await getUserById(u.id);
+  r.json({user:pub(updated)});
+ }catch(e){console.error(e);r.status(500).json({error:"Não foi possível remover a foto."})}
+});
+app.get("/api/avatar/:code",async(q,r)=>{
+ try{
+  const x=await pool.query("SELECT avatar_mime,avatar_data,avatar_updated_at FROM users WHERE code=$1 LIMIT 1",[String(q.params.code||"").trim().toUpperCase()]);
+  const row=x.rows[0];
+  if(!row?.avatar_mime||!row.avatar_data)return r.status(404).end();
+  const etag='"'+(row.avatar_updated_at?new Date(row.avatar_updated_at).getTime():0)+'"';
+  if(q.headers["if-none-match"]===etag)return r.status(304).end();
+  r.setHeader("Content-Type",row.avatar_mime);r.setHeader("Cache-Control","public, max-age=86400");r.setHeader("ETag",etag);
+  r.end(row.avatar_data);
+ }catch(e){console.error("avatar-serve",e);r.status(500).end()}
+});
 function feedPublic(row,viewerId){
  return {
   id:row.id,body:row.body||"",created_at:row.created_at,author_id:row.author_id,name:row.name,code:row.code,
+  avatarUrl:avatarUrlFor({code:row.code,avatar_mime:row.avatar_mime,avatar_updated_at:row.avatar_updated_at}),
   likes:Number(row.likes||0),liked:!!row.liked,
   media:row.media_id?{id:row.media_id,type:row.media_type,name:row.media_name,mime:row.media_mime,size:Number(row.media_size||0),duration:Number(row.media_duration||0),url:"/api/feed/media/"+row.media_id+"?mt="+encodeURIComponent(makeMediaToken(row.media_id,viewerId))}:null
  };
@@ -248,7 +287,7 @@ app.get("/api/feed",async(q,r)=>{try{
  const limit=Math.min(Math.max(Number(q.query.limit)||30,1),50);
  const x=await pool.query(`SELECT p.id,p.body,p.created_at,p.media_type,p.media_name,p.media_mime,p.media_size,p.media_duration,
    CASE WHEN p.media_data IS NOT NULL THEN p.id END AS media_id,
-   u.id AS author_id,u.name,u.code,COUNT(l.post_id)::int AS likes,BOOL_OR(l.user_id=$1) AS liked
+   u.id AS author_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,COUNT(l.post_id)::int AS likes,BOOL_OR(l.user_id=$1) AS liked
    FROM social_posts p JOIN users u ON u.id=p.author_id
    LEFT JOIN social_likes l ON l.post_id=p.id
    WHERE p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1)
@@ -508,14 +547,15 @@ app.post("/api/security/block",async(q,r)=>{try{const u=await auth(q,r);if(!u)re
 app.post("/api/security/unblock",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;await pool.query("DELETE FROM blocked_users WHERE user_id=$1 AND blocked_id=(SELECT id FROM users WHERE code=$2)",[u.id,String(q.body?.code||"").trim().toUpperCase()]);r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível desbloquear."})}});
 app.post("/api/security/report",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const target=await getUserByCode(q.body?.code);const reason=String(q.body?.reason||"").trim().slice(0,64),details=String(q.body?.details||"").trim().slice(0,1000);if(!target||Number(target.id)===Number(u.id)||!reason)return r.status(400).json({error:"Denúncia inválida."});await pool.query("INSERT INTO reports(reporter_id,target_id,reason,details) VALUES($1,$2,$3,$4)",[u.id,target.id,reason,details||null]);await securityEvent(u.id,"REPORT_CREATED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{target:target.code,reason}});r.json({ok:true,message:"Denúncia registrada."})}catch(e){r.status(500).json({error:"Não foi possível registrar a denúncia."})}});
 
-app.get("/api/friends",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const f=await pool.query(`SELECT u.name,u.email,u.code FROM friendships f JOIN users u ON u.id=f.friend_id WHERE f.user_id=$1 ORDER BY u.name`,[u.id]);const reqs=await pool.query(`SELECT u.name,u.email,u.code FROM friend_requests fr JOIN users u ON u.id=fr.sender_id WHERE fr.receiver_id=$1 AND fr.status='pending' ORDER BY fr.created_at DESC`,[u.id]);r.json({friends:f.rows.map(u2=>({...pub(u2),online:onlineByCode.has(u2.code)})),requests:reqs.rows.map(pub)})}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar amigos."})}});
+app.get("/api/friends",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const f=await pool.query(`SELECT u.name,u.email,u.code,u.avatar_mime,u.avatar_updated_at FROM friendships f JOIN users u ON u.id=f.friend_id WHERE f.user_id=$1 ORDER BY u.name`,[u.id]);const reqs=await pool.query(`SELECT u.name,u.email,u.code,u.avatar_mime,u.avatar_updated_at FROM friend_requests fr JOIN users u ON u.id=fr.sender_id WHERE fr.receiver_id=$1 AND fr.status='pending' ORDER BY fr.created_at DESC`,[u.id]);r.json({friends:f.rows.map(u2=>({...pub(u2),online:onlineByCode.has(u2.code)})),requests:reqs.rows.map(pub)})}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar amigos."})}});
 app.post("/api/friends/request",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Usuário não encontrado."});if(x.id===u.id)return r.status(400).json({error:"Você não pode adicionar a si mesmo."});const privacy=await privacyFor(x.id);if(privacy.friend_policy==="nobody")return r.status(403).json({error:"Este usuário não aceita solicitações de amizade."});if(privacy.friend_policy==="friends"){const fof=await pool.query("SELECT 1 FROM friendships a JOIN friendships b ON a.friend_id=b.friend_id WHERE a.user_id=$1 AND b.user_id=$2 LIMIT 1",[u.id,x.id]);if(!fof.rowCount)return r.status(403).json({error:"Este usuário aceita apenas amigos de amigos."});}const exists=await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[u.id,x.id]);if(exists.rowCount)return r.status(400).json({error:"Vocês já são amigos."});const reverse=await pool.query("SELECT 1 FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(reverse.rowCount)return r.status(400).json({error:"Esse usuário já enviou uma solicitação para você."});await pool.query("INSERT INTO friend_requests(sender_id,receiver_id,status) VALUES($1,$2,'pending') ON CONFLICT(sender_id,receiver_id) DO UPDATE SET status='pending'",[u.id,x.id]);notifyUser(x.code,"friend-request",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Novo convite de amizade",u.name+" quer ser seu amigo.",{code:u.code});r.json({message:"Solicitação enviada."})}catch(e){console.error(e);r.status(500).json({error:"Erro ao enviar solicitação."})}});
 app.post("/api/friends/accept",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Solicitação não encontrada."});const a=await pool.query("SELECT id FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(!a.rowCount)return r.status(404).json({error:"Solicitação não encontrada."});const client=await pool.connect();try{await client.query("BEGIN");await client.query("UPDATE friend_requests SET status='accepted' WHERE id=$1",[a.rows[0].id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,x.id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[x.id,u.id]);await client.query("COMMIT")}catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}notifyUser(x.code,"friend-accepted",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Convite aceito",u.name+" aceitou seu convite.",{code:u.code});r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao aceitar solicitação."})}});
 app.post("/api/friends/reject",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Solicitação não encontrada."});const a=await pool.query("DELETE FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(!a.rowCount)return r.status(404).json({error:"Solicitação não encontrada."});r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao recusar solicitação."})}});
 app.post("/api/friends/remove",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").toUpperCase(),x=await getUserByCode(c);if(x){await pool.query("DELETE FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1)",[u.id,x.id])}r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao remover amigo."})}});
-function userList(room){const x=rooms.get(room);return x?[...x.values()].map(v=>({id:v.id,name:v.name,code:v.code,host:v.id===calls.get(room)})):[]}
+function userList(room){const x=rooms.get(room);return x?[...x.values()].map(v=>({id:v.id,name:v.name,code:v.code,avatarUrl:v.avatarUrl,host:v.id===calls.get(room)})):[]}
 const broadcast=room=>io.to(room).emit("room-users",userList(room)),valid=(s,id)=>!!rooms.get(s.data.room)?.has(id),ready=room=>(callReady.has(room)||callReady.set(room,new Set()),callReady.get(room));
 function cleanReady(room,id){const s=callReady.get(room);if(!s)return;s.delete(id);if(!s.size)callReady.delete(room)}
+
 io.use(async(s,n)=>{try{
  const t=String(s.handshake.auth?.token||"").trim();
  const sess=await getSession(t);
@@ -533,7 +573,7 @@ io.on("connection",s=>{
    onlineByCode.get(meCode).add(s.id);
  }
  s.on("client-ping",t=>s.emit("client-pong",t));
- s.on("join",({room})=>{const u=s.data.user;if(!u)return;s.data.room=String(room||"geral").replace(/[^a-zA-Z0-9_-]/g,"").slice(0,32)||"geral";s.data.name=u.name;s.data.code=u.code;const rm=s.data.room;if(!rooms.has(rm))rooms.set(rm,new Map());rooms.get(rm).set(s.id,{id:s.id,name:u.name,code:u.code});s.join(rm);s.emit("room-users",userList(rm));s.to(rm).emit("user-joined",{id:s.id,name:u.name,code:u.code});if(calls.has(rm)){const h=calls.get(rm);s.emit("call-host",h);s.emit("call-state",{active:true,host:h,ready:[...ready(rm)]})}else s.emit("call-state",{active:false,host:null,ready:[]});if(roomMusic.has(rm))s.emit("music-state",musicStateFor(rm));});
+ s.on("join",({room})=>{const u=s.data.user;if(!u)return;s.data.room=String(room||"geral").replace(/[^a-zA-Z0-9_-]/g,"").slice(0,32)||"geral";s.data.name=u.name;s.data.code=u.code;const rm=s.data.room;if(!rooms.has(rm))rooms.set(rm,new Map());rooms.get(rm).set(s.id,{id:s.id,name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)});s.join(rm);s.emit("room-users",userList(rm));s.to(rm).emit("user-joined",{id:s.id,name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)});if(calls.has(rm)){const h=calls.get(rm);s.emit("call-host",h);s.emit("call-state",{active:true,host:h,ready:[...ready(rm)]})}else s.emit("call-state",{active:false,host:null,ready:[]});if(roomMusic.has(rm))s.emit("music-state",musicStateFor(rm));});
  s.on("chat",({room,text})=>{if(room!==s.data.room)return;const t=String(text||"").trim().slice(0,1000);if(t)io.to(room).emit("chat",{name:s.data.name,text:t,time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})})});
  s.on("call-start",({room},ack)=>{if(room!==s.data.room){if(typeof ack==="function")ack({ok:false,error:"Sala inválida"});return;}if(!calls.has(room)){calls.set(room,s.id);ready(room).add(s.id);io.to(room).emit("call-host",s.id);io.to(room).emit("system",s.data.name+" criou uma call.");broadcast(room)}const host=calls.get(room);s.emit("call-host",host);s.emit("call-state",{active:true,host,ready:[...ready(room)]});if(typeof ack==="function")ack({ok:true,host,ready:[...ready(room)]});});
  s.on("call-ready",({room})=>{
@@ -552,6 +592,7 @@ io.on("connection",s=>{
    for(const id of ready(room)){if(id!==s.id)io.to(id).emit("call-participant-ready",{id:s.id,name:s.data.name});}
  });
  s.on("call-ready-request",({room})=>{if(room===s.data.room&&calls.get(room)===s.id)s.emit("call-ready-users",[...ready(room)].filter(id=>id!==s.id&&valid(s,id)))});
+ s.on("call-camera-state",({room,on})=>{if(room!==s.data.room)return;s.to(room).emit("call-camera-state",{id:s.id,on:!!on})});
  s.on("call-leave",({room})=>{if(room===s.data.room){cleanReady(room,s.id);pendingSignals.delete(s.id);s.to(room).emit("call-participant-left",{id:s.id})}});
  function leaveRoom(s,room,{keepSocketRoom}={}){
    const rm=rooms.get(room);if(!rm)return;
@@ -632,7 +673,7 @@ const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
 const PORT=Number(process.env.PORT)||3000;
 server.listen(PORT,"0.0.0.0",()=>{
-  console.log("Conversa Live v3.1.0 server ativo na porta "+PORT);
+  console.log("FreeChat v3.1.3 server ativo na porta "+PORT);
   initDbWithRetry();
 });
 async function initDbWithRetry(){
