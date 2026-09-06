@@ -224,11 +224,11 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("Conversa Live server OK — v3.0.6 PostgreSQL + música"));
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v3.1.0 PostgreSQL + música"));
 app.get("/health",async(_,r)=>{
-  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"3.0.6",service:"conversa-live-server"});
-  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"3.0.6",service:"conversa-live-server"})}
-  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"3.0.6",service:"conversa-live-server"})}
+  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"3.1.0",service:"conversa-live-server"});
+  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"3.1.0",service:"conversa-live-server"})}
+  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"3.1.0",service:"conversa-live-server"})}
 });
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
@@ -630,7 +630,7 @@ const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
 const PORT=Number(process.env.PORT)||3000;
 server.listen(PORT,"0.0.0.0",()=>{
-  console.log("Conversa Live v3.0.6 server ativo na porta "+PORT);
+  console.log("Conversa Live v3.1.0 server ativo na porta "+PORT);
   initDbWithRetry();
 });
 async function initDbWithRetry(){
