@@ -88,6 +88,21 @@ async function initDb(){
    post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(post_id,user_id)
  )`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS social_comments(
+   id BIGSERIAL PRIMARY KEY,
+   post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   body VARCHAR(800) NOT NULL,
+   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ )`);
+ await pool.query("CREATE INDEX IF NOT EXISTS social_comments_post_idx ON social_comments(post_id,created_at ASC)");
+ await pool.query(`CREATE TABLE IF NOT EXISTS social_saves(
+   post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+   PRIMARY KEY(post_id,user_id)
+ )`);
+ await pool.query("CREATE INDEX IF NOT EXISTS social_posts_created_idx ON social_posts(created_at DESC,id DESC)");
  await pool.query(`CREATE TABLE IF NOT EXISTS notifications(
    id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    type VARCHAR(32) NOT NULL, title VARCHAR(120) NOT NULL, body VARCHAR(500), data JSONB, read_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -232,11 +247,11 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("FreeChat server OK — v3.1.3 PostgreSQL + música"));
+app.get("/",(_,r)=>r.send("FreeChat server OK — v1.0.0 PostgreSQL + música"));
 app.get("/health",async(_,r)=>{
-  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"3.1.0",service:"conversa-live-server"});
-  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"3.1.0",service:"conversa-live-server"})}
-  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"3.1.0",service:"conversa-live-server"})}
+  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"1.0.0",service:"conversa-live-server"});
+  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.0.0",service:"conversa-live-server"})}
+  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"1.0.0",service:"conversa-live-server"})}
 });
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
@@ -278,23 +293,45 @@ function feedPublic(row,viewerId){
  return {
   id:row.id,body:row.body||"",created_at:row.created_at,author_id:row.author_id,name:row.name,code:row.code,
   avatarUrl:avatarUrlFor({code:row.code,avatar_mime:row.avatar_mime,avatar_updated_at:row.avatar_updated_at}),
-  likes:Number(row.likes||0),liked:!!row.liked,
+  likes:Number(row.likes||0),liked:!!row.liked,saves:Number(row.saves||0),saved:!!row.saved,comments:Number(row.comments||0),
   media:row.media_id?{id:row.media_id,type:row.media_type,name:row.media_name,mime:row.media_mime,size:Number(row.media_size||0),duration:Number(row.media_duration||0),url:"/api/feed/media/"+row.media_id+"?mt="+encodeURIComponent(makeMediaToken(row.media_id,viewerId))}:null
  };
 }
 app.get("/api/feed",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
- const limit=Math.min(Math.max(Number(q.query.limit)||30,1),50);
+ const limit=Math.min(Math.max(Number(q.query.limit)||12,1),24);
+ const offset=Math.min(Math.max(Number(q.query.offset)||0,0),10000);
  const x=await pool.query(`SELECT p.id,p.body,p.created_at,p.media_type,p.media_name,p.media_mime,p.media_size,p.media_duration,
    CASE WHEN p.media_data IS NOT NULL THEN p.id END AS media_id,
-   u.id AS author_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,COUNT(l.post_id)::int AS likes,BOOL_OR(l.user_id=$1) AS liked
+   u.id AS author_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,
+   COUNT(DISTINCT l.post_id)::int AS likes,COALESCE(BOOL_OR(l.user_id=$1),false) AS liked,
+   COUNT(DISTINCT c.id)::int AS comments,COUNT(DISTINCT sv.user_id)::int AS saves,COALESCE(BOOL_OR(sv.user_id=$1),false) AS saved
    FROM social_posts p JOIN users u ON u.id=p.author_id
    LEFT JOIN social_likes l ON l.post_id=p.id
+   LEFT JOIN social_comments c ON c.post_id=p.id
+   LEFT JOIN social_saves sv ON sv.post_id=p.id
    WHERE p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1)
-   GROUP BY p.id,u.id ORDER BY p.created_at DESC LIMIT $2`,[u.id,limit]);
- r.json({posts:x.rows.map(p=>feedPublic(p,u.id))});
+   GROUP BY p.id,u.id ORDER BY p.created_at DESC,p.id DESC LIMIT $2 OFFSET $3`,[u.id,limit,offset]);
+ r.json({posts:x.rows.map(p=>feedPublic(p,u.id)),hasMore:x.rows.length===limit,offset:offset+x.rows.length});
 }catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar o feed."})}});
 
+app.get("/api/feed/:id/comments",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
+ const x=await pool.query(`SELECT c.id,c.body,c.created_at,u.name,u.code,u.avatar_mime,u.avatar_updated_at FROM social_comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=$1 ORDER BY c.created_at ASC LIMIT 100`,[id]);
+ r.json({comments:x.rows.map(c=>({...c,avatarUrl:avatarUrlFor(c)}))});
+}catch(e){console.error(e);r.status(500).json({error:"Não foi possível carregar os comentários."})}});
+app.post("/api/feed/:id/comments",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),body=String(q.body?.body||"").trim();if(!Number.isSafeInteger(id)||id<1||!body)return r.status(400).json({error:"Comentário inválido."});if(body.length>800)return r.status(400).json({error:"O comentário pode ter no máximo 800 caracteres."});
+ const post=await pool.query("SELECT author_id FROM social_posts WHERE id=$1",[id]);if(!post.rowCount)return r.status(404).json({error:"Publicação não encontrada."});
+ const x=await pool.query(`INSERT INTO social_comments(post_id,user_id,body) VALUES($1,$2,$3) RETURNING id,body,created_at`,[id,u.id,body]);
+ if(Number(post.rows[0].author_id)!==Number(u.id)){await addNotification(post.rows[0].author_id,"social","Novo comentário",u.name+" comentou em sua publicação.",{postId:id});}
+ r.json({comment:{...x.rows[0],name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)}});
+}catch(e){console.error(e);r.status(500).json({error:"Não foi possível comentar."})}});
+app.post("/api/feed/:id/save",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
+ const exists=await pool.query("SELECT 1 FROM social_saves WHERE post_id=$1 AND user_id=$2",[id,u.id]);let saved;if(exists.rowCount){await pool.query("DELETE FROM social_saves WHERE post_id=$1 AND user_id=$2",[id,u.id]);saved=false}else{await pool.query("INSERT INTO social_saves(post_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[id,u.id]);saved=true}
+ const c=await pool.query("SELECT COUNT(*)::int AS saves FROM social_saves WHERE post_id=$1",[id]);r.json({saved,saves:c.rows[0].saves});
+}catch(e){r.status(500).json({error:"Não foi possível salvar a publicação."})}});
 app.post("/api/feed",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
  const body=String(q.body?.body||"").trim();
@@ -351,7 +388,50 @@ app.get("/api/feed/media/:id",async(q,r)=>{try{
  r.setHeader("Content-Length",total);r.end(buf);
 }catch(e){console.error("feed-media",e);r.status(500).end()}});
 
-app.post("/api/feed/:id/like",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);const exists=await pool.query("SELECT 1 FROM social_likes WHERE post_id=$1 AND user_id=$2",[id,u.id]);let liked;if(exists.rowCount){await pool.query("DELETE FROM social_likes WHERE post_id=$1 AND user_id=$2",[id,u.id]);liked=false}else{await pool.query("INSERT INTO social_likes(post_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[id,u.id]);liked=true}const c=await pool.query("SELECT COUNT(*)::int AS likes FROM social_likes WHERE post_id=$1",[id]);r.json({liked,likes:c.rows[0].likes})}catch(e){r.status(500).json({error:"Não foi possível reagir."})}});
+function feedPublic(row,viewerId){
+ return {
+  id:row.id,body:row.body||"",created_at:row.created_at,author_id:row.author_id,name:row.name,code:row.code,
+  avatarUrl:avatarUrlFor({code:row.code,avatar_mime:row.avatar_mime,avatar_updated_at:row.avatar_updated_at}),
+  likes:Number(row.likes||0),liked:!!row.liked,saves:Number(row.saves||0),saved:!!row.saved,comments:Number(row.comments||0),
+  media:row.media_id?{id:row.media_id,type:row.media_type,name:row.media_name,mime:row.media_mime,size:Number(row.media_size||0),duration:Number(row.media_duration||0),url:"/api/feed/media/"+row.media_id+"?mt="+encodeURIComponent(makeMediaToken(row.media_id,viewerId))}:null
+ };
+}
+app.get("/api/feed",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const limit=Math.min(Math.max(Number(q.query.limit)||12,1),24);
+ const offset=Math.min(Math.max(Number(q.query.offset)||0,0),10000);
+ const x=await pool.query(`SELECT p.id,p.body,p.created_at,p.media_type,p.media_name,p.media_mime,p.media_size,p.media_duration,
+   CASE WHEN p.media_data IS NOT NULL THEN p.id END AS media_id,
+   u.id AS author_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,
+   COUNT(DISTINCT l.post_id)::int AS likes,COALESCE(BOOL_OR(l.user_id=$1),false) AS liked,
+   COUNT(DISTINCT c.id)::int AS comments,COUNT(DISTINCT sv.user_id)::int AS saves,COALESCE(BOOL_OR(sv.user_id=$1),false) AS saved
+   FROM social_posts p JOIN users u ON u.id=p.author_id
+   LEFT JOIN social_likes l ON l.post_id=p.id
+   LEFT JOIN social_comments c ON c.post_id=p.id
+   LEFT JOIN social_saves sv ON sv.post_id=p.id
+   WHERE p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1)
+   GROUP BY p.id,u.id ORDER BY p.created_at DESC,p.id DESC LIMIT $2 OFFSET $3`,[u.id,limit,offset]);
+ r.json({posts:x.rows.map(p=>feedPublic(p,u.id)),hasMore:x.rows.length===limit,offset:offset+x.rows.length});
+}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar o feed."})}});
+
+app.get("/api/feed/:id/comments",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
+ const x=await pool.query(`SELECT c.id,c.body,c.created_at,u.name,u.code,u.avatar_mime,u.avatar_updated_at FROM social_comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=$1 ORDER BY c.created_at ASC LIMIT 100`,[id]);
+ r.json({comments:x.rows.map(c=>({...c,avatarUrl:avatarUrlFor(c)}))});
+}catch(e){console.error(e);r.status(500).json({error:"Não foi possível carregar os comentários."})}});
+app.post("/api/feed/:id/comments",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),body=String(q.body?.body||"").trim();if(!Number.isSafeInteger(id)||id<1||!body)return r.status(400).json({error:"Comentário inválido."});if(body.length>800)return r.status(400).json({error:"O comentário pode ter no máximo 800 caracteres."});
+ const post=await pool.query("SELECT author_id FROM social_posts WHERE id=$1",[id]);if(!post.rowCount)return r.status(404).json({error:"Publicação não encontrada."});
+ const x=await pool.query(`INSERT INTO social_comments(post_id,user_id,body) VALUES($1,$2,$3) RETURNING id,body,created_at`,[id,u.id,body]);
+ if(Number(post.rows[0].author_id)!==Number(u.id)){await addNotification(post.rows[0].author_id,"social","Novo comentário",u.name+" comentou em sua publicação.",{postId:id});}
+ r.json({comment:{...x.rows[0],name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)}});
+}catch(e){console.error(e);r.status(500).json({error:"Não foi possível comentar."})}});
+app.post("/api/feed/:id/save",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
+ const exists=await pool.query("SELECT 1 FROM social_saves WHERE post_id=$1 AND user_id=$2",[id,u.id]);let saved;if(exists.rowCount){await pool.query("DELETE FROM social_saves WHERE post_id=$1 AND user_id=$2",[id,u.id]);saved=false}else{await pool.query("INSERT INTO social_saves(post_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[id,u.id]);saved=true}
+ const c=await pool.query("SELECT COUNT(*)::int AS saves FROM social_saves WHERE post_id=$1",[id]);r.json({saved,saves:c.rows[0].saves});
+}catch(e){r.status(500).json({error:"Não foi possível salvar a publicação."})}});
+
 app.get("/api/notifications",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const x=await pool.query("SELECT id,type,title,body,data,read_at,created_at FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50",[u.id]);const unread=x.rows.filter(n=>!n.read_at).length;r.json({notifications:x.rows,unread})}catch(e){r.status(500).json({error:"Erro ao carregar notificações."})}});
 app.post("/api/notifications/read",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;await pool.query("UPDATE notifications SET read_at=NOW() WHERE user_id=$1 AND read_at IS NULL",[u.id]);r.json({ok:true})}catch(e){r.status(500).json({error:"Erro ao marcar notificações."})}});
 app.get("/api/music/search",async(q,r)=>{
@@ -691,7 +771,7 @@ const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
 const PORT=Number(process.env.PORT)||3000;
 server.listen(PORT,"0.0.0.0",()=>{
-  console.log("FreeChat v3.1.3 server ativo na porta "+PORT);
+  console.log("FreeChat v1.0.0 server ativo na porta "+PORT);
   initDbWithRetry();
 });
 async function initDbWithRetry(){
