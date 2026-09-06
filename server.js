@@ -368,7 +368,10 @@ app.get("/api/music/search",async(q,r)=>{
     if(process.env.AUDIUS_API_KEY)headers["x-api-key"]=process.env.AUDIUS_API_KEY;
     const x=await fetch(u,{headers});
     const body=await x.json().catch(()=>({}));
-    if(!x.ok)return r.status(x.status===401||x.status===403?503:502).json({error:"O serviço de música recusou a busca. Configure AUDIUS_API_KEY no Render."});
+    if(!x.ok){
+      console.error("Audius search",x.status,body?.message||body?.error||"");
+      return r.status(x.status===401||x.status===403?503:502).json({error:"O serviço de música recusou a busca. Verifique a chave do Audius no servidor."});
+    }
     const rows=Array.isArray(body.data)?body.data:[];
     r.json({tracks:rows.filter(t=>t&&t.id&&t.isStreamable!==false).slice(0,8).map(t=>({
       id:String(t.id),title:String(t.title||"Sem título").slice(0,120),artist:String(t.user?.name||"Artista desconhecido").slice(0,80),
@@ -401,10 +404,15 @@ app.get("/api/music/stream/:id",async(q,r)=>{
     if(process.env.AUDIUS_API_KEY)headers["x-api-key"]=process.env.AUDIUS_API_KEY;
     if(q.headers.range)headers.Range=q.headers.range;
     const x=await fetch(u,{headers,redirect:"follow"});
-    if(!x.ok)return r.status(x.status===401||x.status===403?503:502).json({error:"Não foi possível abrir o áudio desta faixa."});
+    if(!x.ok){
+      const detail=await x.text().catch(()=>"");
+      console.error("Audius stream",x.status,detail.slice(0,300));
+      return r.status(x.status===401||x.status===403?503:502).json({error:"Não foi possível abrir o áudio desta faixa."});
+    }
     const ct=x.headers.get("content-type")||"audio/mpeg";
     r.status(x.status);
     r.setHeader("Content-Type",ct);r.setHeader("Cache-Control","no-store");r.setHeader("Accept-Ranges","bytes");
+    r.setHeader("Access-Control-Allow-Origin",q.headers.origin||"*");
     for(const h of ["content-length","content-range","etag","last-modified"]){const v=x.headers.get(h);if(v)r.setHeader(h,v);}
     if(x.body){const {Readable}=require("stream");return Readable.fromWeb(x.body).pipe(r);}
     r.status(502).json({error:"Stream de áudio indisponível."});
@@ -575,7 +583,16 @@ io.on("connection",s=>{
  s.on("client-ping",t=>s.emit("client-pong",t));
  s.on("join",({room})=>{const u=s.data.user;if(!u)return;s.data.room=String(room||"geral").replace(/[^a-zA-Z0-9_-]/g,"").slice(0,32)||"geral";s.data.name=u.name;s.data.code=u.code;const rm=s.data.room;if(!rooms.has(rm))rooms.set(rm,new Map());rooms.get(rm).set(s.id,{id:s.id,name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)});s.join(rm);s.emit("room-users",userList(rm));s.to(rm).emit("user-joined",{id:s.id,name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)});if(calls.has(rm)){const h=calls.get(rm);s.emit("call-host",h);s.emit("call-state",{active:true,host:h,ready:[...ready(rm)]})}else s.emit("call-state",{active:false,host:null,ready:[]});if(roomMusic.has(rm))s.emit("music-state",musicStateFor(rm));});
  s.on("chat",({room,text})=>{if(room!==s.data.room)return;const t=String(text||"").trim().slice(0,1000);if(t)io.to(room).emit("chat",{name:s.data.name,text:t,time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})})});
- s.on("call-start",({room},ack)=>{if(room!==s.data.room){if(typeof ack==="function")ack({ok:false,error:"Sala inválida"});return;}if(!calls.has(room)){calls.set(room,s.id);ready(room).add(s.id);io.to(room).emit("call-host",s.id);io.to(room).emit("system",s.data.name+" criou uma call.");broadcast(room)}const host=calls.get(room);s.emit("call-host",host);s.emit("call-state",{active:true,host,ready:[...ready(room)]});if(typeof ack==="function")ack({ok:true,host,ready:[...ready(room)]});});
+ s.on("profile-updated",({avatarUrl,name})=>{
+   const u=s.data.user;if(!u)return;
+   if(typeof name==="string"&&name.trim())u.name=name.trim().slice(0,24);
+   u.avatarUrl=typeof avatarUrl==="string"&&avatarUrl?avatarUrl:null;
+   s.data.name=u.name;
+   const rm=s.data.room,entry=rm&&rooms.get(rm)?.get(s.id);
+   if(entry){entry.name=u.name;entry.avatarUrl=u.avatarUrl;}
+   if(rm){s.to(rm).emit("user-profile-updated",{id:s.id,name:u.name,avatarUrl:u.avatarUrl});broadcast(rm);}
+ });
+ s.on("call-start",({room},ack)=>{if(room!==s.data.room){if(typeof ack==="function")ack({ok:false,error:"Sala inválida"});return;}const created=!calls.has(room);if(created){calls.set(room,s.id);ready(room).add(s.id);io.to(room).emit("call-host",s.id);io.to(room).emit("call-created",{byId:s.id,name:s.data.name});io.to(room).emit("system",s.data.name+" criou uma call.");broadcast(room)}const host=calls.get(room);s.emit("call-host",host);s.emit("call-state",{active:true,host,ready:[...ready(room)]});if(typeof ack==="function")ack({ok:true,host,created,ready:[...ready(room)]});});
  s.on("call-ready",({room})=>{
    if(room!==s.data.room||!calls.has(room))return;
    ready(room).add(s.id);
@@ -589,7 +606,7 @@ io.on("connection",s=>{
    for(const q of queued){
      if(q?.room===room&&valid(s,q.from))io.to(s.id).emit("signal",{from:q.from,data:q.data});
    }
-   for(const id of ready(room)){if(id!==s.id)io.to(id).emit("call-participant-ready",{id:s.id,name:s.data.name});}
+   for(const id of ready(room)){if(id!==s.id){io.to(id).emit("call-participant-ready",{id:s.id,name:s.data.name});io.to(id).emit("call-participant-joined",{id:s.id,name:s.data.name});}}
  });
  s.on("call-ready-request",({room})=>{if(room===s.data.room&&calls.get(room)===s.id)s.emit("call-ready-users",[...ready(room)].filter(id=>id!==s.id&&valid(s,id)))});
  s.on("call-camera-state",({room,on})=>{if(room!==s.data.room)return;s.to(room).emit("call-camera-state",{id:s.id,on:!!on})});
