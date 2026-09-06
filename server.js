@@ -610,6 +610,7 @@ io.on("connection",s=>{
  });
  s.on("call-ready-request",({room})=>{if(room===s.data.room&&calls.get(room)===s.id)s.emit("call-ready-users",[...ready(room)].filter(id=>id!==s.id&&valid(s,id)))});
  s.on("call-camera-state",({room,on})=>{if(room!==s.data.room)return;s.to(room).emit("call-camera-state",{id:s.id,on:!!on})});
+ s.on("call-screen-state",({room,sharing})=>{if(room!==s.data.room||!calls.has(room))return;s.to(room).emit("call-screen-state",{id:s.id,sharing:!!sharing})});
  s.on("call-leave",({room})=>{if(room===s.data.room){cleanReady(room,s.id);pendingSignals.delete(s.id);s.to(room).emit("call-participant-left",{id:s.id})}});
  function leaveRoom(s,room,{keepSocketRoom}={}){
    const rm=rooms.get(room);if(!rm)return;
