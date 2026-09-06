@@ -247,11 +247,11 @@ async function auth(req,res){
   return u;
 }
 
-app.get("/",(_,r)=>r.send("FreeChat server OK — v1.0.0 PostgreSQL + música"));
+app.get("/",(_,r)=>r.send("FreeChat server OK — v1.1.0 PostgreSQL + música"));
 app.get("/health",async(_,r)=>{
-  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"1.0.0",service:"conversa-live-server"});
-  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.0.0",service:"conversa-live-server"})}
-  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"1.0.0",service:"conversa-live-server"})}
+  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"1.1.0",service:"conversa-live-server"});
+  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.1.0",service:"conversa-live-server"})}
+  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"1.1.0",service:"conversa-live-server"})}
 });
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
@@ -301,6 +301,11 @@ app.get("/api/feed",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
  const limit=Math.min(Math.max(Number(q.query.limit)||12,1),24);
  const offset=Math.min(Math.max(Number(q.query.offset)||0,0),10000);
+ const filter=String(q.query.filter||"recent");
+ // "friends": só publicações de amigos (exclui as suas). "recent" (padrão): você + amigos por recência.
+ const scopeSql=filter==="friends"
+   ? "p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1)"
+   : "p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1)";
  const x=await pool.query(`SELECT p.id,p.body,p.created_at,p.media_type,p.media_name,p.media_mime,p.media_size,p.media_duration,
    CASE WHEN p.media_data IS NOT NULL THEN p.id END AS media_id,
    u.id AS author_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,
@@ -310,25 +315,52 @@ app.get("/api/feed",async(q,r)=>{try{
    LEFT JOIN social_likes l ON l.post_id=p.id
    LEFT JOIN social_comments c ON c.post_id=p.id
    LEFT JOIN social_saves sv ON sv.post_id=p.id
-   WHERE p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1)
+   WHERE ${scopeSql}
    GROUP BY p.id,u.id ORDER BY p.created_at DESC,p.id DESC LIMIT $2 OFFSET $3`,[u.id,limit,offset]);
  r.json({posts:x.rows.map(p=>feedPublic(p,u.id)),hasMore:x.rows.length===limit,offset:offset+x.rows.length});
 }catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar o feed."})}});
 
+async function canViewFeedPost(viewerId,postId){
+ const x=await pool.query(`SELECT p.author_id, EXISTS(SELECT 1 FROM friendships f WHERE f.user_id=$1 AND f.friend_id=p.author_id) AS is_friend
+   FROM social_posts p WHERE p.id=$2 LIMIT 1`,[viewerId,postId]);
+ if(!x.rowCount)return null;
+ const row=x.rows[0];
+ return Number(row.author_id)===Number(viewerId)||!!row.is_friend?Number(row.author_id):false;
+}
+app.post("/api/feed/:id/like",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const id=Number(q.params.id);
+ if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
+ if(!rateLimit("feed-like:"+u.id,120,60*1000))return r.status(429).json({error:"Muitas reações em pouco tempo. Aguarde um instante."});
+ const authorId=await canViewFeedPost(u.id,id);
+ if(authorId===null)return r.status(404).json({error:"Publicação não encontrada."});
+ if(authorId===false)return r.status(403).json({error:"Você não pode interagir com esta publicação."});
+ const exists=await pool.query("SELECT 1 FROM social_likes WHERE post_id=$1 AND user_id=$2",[id,u.id]);
+ let liked;
+ if(exists.rowCount){await pool.query("DELETE FROM social_likes WHERE post_id=$1 AND user_id=$2",[id,u.id]);liked=false}
+ else {await pool.query("INSERT INTO social_likes(post_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[id,u.id]);liked=true}
+ const c=await pool.query("SELECT COUNT(*)::int AS likes FROM social_likes WHERE post_id=$1",[id]);
+ if(liked&&Number(authorId)!==Number(u.id))await addNotification(authorId,"social","Nova curtida",u.name+" curtiu sua publicação.",{postId:id});
+ r.json({liked,likes:Number(c.rows[0].likes||0)});
+}catch(e){console.error(e);r.status(500).json({error:"Não foi possível atualizar a curtida."})}});
+
 app.get("/api/feed/:id/comments",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
+ const visible=await canViewFeedPost(u.id,id);if(visible===null)return r.status(404).json({error:"Publicação não encontrada."});if(visible===false)return r.status(403).json({error:"Você não pode ver os comentários desta publicação."});
  const x=await pool.query(`SELECT c.id,c.body,c.created_at,u.name,u.code,u.avatar_mime,u.avatar_updated_at FROM social_comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=$1 ORDER BY c.created_at ASC LIMIT 100`,[id]);
  r.json({comments:x.rows.map(c=>({...c,avatarUrl:avatarUrlFor(c)}))});
 }catch(e){console.error(e);r.status(500).json({error:"Não foi possível carregar os comentários."})}});
 app.post("/api/feed/:id/comments",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),body=String(q.body?.body||"").trim();if(!Number.isSafeInteger(id)||id<1||!body)return r.status(400).json({error:"Comentário inválido."});if(body.length>800)return r.status(400).json({error:"O comentário pode ter no máximo 800 caracteres."});
- const post=await pool.query("SELECT author_id FROM social_posts WHERE id=$1",[id]);if(!post.rowCount)return r.status(404).json({error:"Publicação não encontrada."});
+ const visible=await canViewFeedPost(u.id,id);if(visible===null)return r.status(404).json({error:"Publicação não encontrada."});if(visible===false)return r.status(403).json({error:"Você não pode comentar nesta publicação."});
+ const post=await pool.query("SELECT author_id FROM social_posts WHERE id=$1",[id]);
  const x=await pool.query(`INSERT INTO social_comments(post_id,user_id,body) VALUES($1,$2,$3) RETURNING id,body,created_at`,[id,u.id,body]);
  if(Number(post.rows[0].author_id)!==Number(u.id)){await addNotification(post.rows[0].author_id,"social","Novo comentário",u.name+" comentou em sua publicação.",{postId:id});}
  r.json({comment:{...x.rows[0],name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)}});
 }catch(e){console.error(e);r.status(500).json({error:"Não foi possível comentar."})}});
 app.post("/api/feed/:id/save",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
+ const visible=await canViewFeedPost(u.id,id);if(visible===null)return r.status(404).json({error:"Publicação não encontrada."});if(visible===false)return r.status(403).json({error:"Você não pode salvar esta publicação."});
  const exists=await pool.query("SELECT 1 FROM social_saves WHERE post_id=$1 AND user_id=$2",[id,u.id]);let saved;if(exists.rowCount){await pool.query("DELETE FROM social_saves WHERE post_id=$1 AND user_id=$2",[id,u.id]);saved=false}else{await pool.query("INSERT INTO social_saves(post_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[id,u.id]);saved=true}
  const c=await pool.query("SELECT COUNT(*)::int AS saves FROM social_saves WHERE post_id=$1",[id]);r.json({saved,saves:c.rows[0].saves});
 }catch(e){r.status(500).json({error:"Não foi possível salvar a publicação."})}});
@@ -371,13 +403,20 @@ app.get("/api/feed/media/:id",async(q,r)=>{try{
  const x=await pool.query(`SELECT p.id,p.author_id,p.media_mime,p.media_name,p.media_size,p.media_data
    FROM social_posts p WHERE p.id=$1 AND p.media_data IS NOT NULL LIMIT 1`,[id]);
  const row=x.rows[0];if(!row)return r.status(404).end();
- const me=await auth(q,r);if(!me)return;
+ // <img>/<video> requests cannot attach the Authorization header. Authenticate
+ // these media requests with the signed viewer token embedded in the media URL.
+ const mt=String(q.query?.mt||"");
+ let tokenViewerId=0;
+ try{
+   const raw=Buffer.from(mt,"base64url").toString();
+   const parts=raw.split(".");
+   if(parts.length===4)tokenViewerId=Number(parts[1])||0;
+ }catch(e){}
+ if(!tokenViewerId || !verifyMediaToken(mt,id,tokenViewerId))return r.status(403).end();
+ const me=await getUserById(tokenViewerId);
+ if(!me)return r.status(401).end();
  const allowed=Number(row.author_id)===Number(me.id) || (await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[me.id,row.author_id])).rowCount;
  if(!allowed)return r.status(403).end();
- const mt=String(q.query?.mt||"");
- // feed media tokens are signed with the same media secret and viewer id
- const tokenOk=verifyMediaToken(mt,id,me.id);
- if(!tokenOk)return r.status(403).end();
  const buf=row.media_data,total=buf.length,mime=row.media_mime||"application/octet-stream";
  r.setHeader("Content-Type",mime);r.setHeader("Content-Disposition",`inline; filename*=UTF-8''${encodeURIComponent(row.media_name||"media")}`);
  r.setHeader("Accept-Ranges","bytes");r.setHeader("Cache-Control","private, max-age=3600");
@@ -387,50 +426,6 @@ app.get("/api/feed/media/:id",async(q,r)=>{try{
    end=Math.min(end,total-1);r.status(206).setHeader("Content-Range",`bytes ${start}-${end}/${total}`);r.setHeader("Content-Length",end-start+1);return r.end(buf.subarray(start,end+1));}}
  r.setHeader("Content-Length",total);r.end(buf);
 }catch(e){console.error("feed-media",e);r.status(500).end()}});
-
-function feedPublic(row,viewerId){
- return {
-  id:row.id,body:row.body||"",created_at:row.created_at,author_id:row.author_id,name:row.name,code:row.code,
-  avatarUrl:avatarUrlFor({code:row.code,avatar_mime:row.avatar_mime,avatar_updated_at:row.avatar_updated_at}),
-  likes:Number(row.likes||0),liked:!!row.liked,saves:Number(row.saves||0),saved:!!row.saved,comments:Number(row.comments||0),
-  media:row.media_id?{id:row.media_id,type:row.media_type,name:row.media_name,mime:row.media_mime,size:Number(row.media_size||0),duration:Number(row.media_duration||0),url:"/api/feed/media/"+row.media_id+"?mt="+encodeURIComponent(makeMediaToken(row.media_id,viewerId))}:null
- };
-}
-app.get("/api/feed",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;
- const limit=Math.min(Math.max(Number(q.query.limit)||12,1),24);
- const offset=Math.min(Math.max(Number(q.query.offset)||0,0),10000);
- const x=await pool.query(`SELECT p.id,p.body,p.created_at,p.media_type,p.media_name,p.media_mime,p.media_size,p.media_duration,
-   CASE WHEN p.media_data IS NOT NULL THEN p.id END AS media_id,
-   u.id AS author_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,
-   COUNT(DISTINCT l.post_id)::int AS likes,COALESCE(BOOL_OR(l.user_id=$1),false) AS liked,
-   COUNT(DISTINCT c.id)::int AS comments,COUNT(DISTINCT sv.user_id)::int AS saves,COALESCE(BOOL_OR(sv.user_id=$1),false) AS saved
-   FROM social_posts p JOIN users u ON u.id=p.author_id
-   LEFT JOIN social_likes l ON l.post_id=p.id
-   LEFT JOIN social_comments c ON c.post_id=p.id
-   LEFT JOIN social_saves sv ON sv.post_id=p.id
-   WHERE p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1)
-   GROUP BY p.id,u.id ORDER BY p.created_at DESC,p.id DESC LIMIT $2 OFFSET $3`,[u.id,limit,offset]);
- r.json({posts:x.rows.map(p=>feedPublic(p,u.id)),hasMore:x.rows.length===limit,offset:offset+x.rows.length});
-}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar o feed."})}});
-
-app.get("/api/feed/:id/comments",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
- const x=await pool.query(`SELECT c.id,c.body,c.created_at,u.name,u.code,u.avatar_mime,u.avatar_updated_at FROM social_comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=$1 ORDER BY c.created_at ASC LIMIT 100`,[id]);
- r.json({comments:x.rows.map(c=>({...c,avatarUrl:avatarUrlFor(c)}))});
-}catch(e){console.error(e);r.status(500).json({error:"Não foi possível carregar os comentários."})}});
-app.post("/api/feed/:id/comments",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),body=String(q.body?.body||"").trim();if(!Number.isSafeInteger(id)||id<1||!body)return r.status(400).json({error:"Comentário inválido."});if(body.length>800)return r.status(400).json({error:"O comentário pode ter no máximo 800 caracteres."});
- const post=await pool.query("SELECT author_id FROM social_posts WHERE id=$1",[id]);if(!post.rowCount)return r.status(404).json({error:"Publicação não encontrada."});
- const x=await pool.query(`INSERT INTO social_comments(post_id,user_id,body) VALUES($1,$2,$3) RETURNING id,body,created_at`,[id,u.id,body]);
- if(Number(post.rows[0].author_id)!==Number(u.id)){await addNotification(post.rows[0].author_id,"social","Novo comentário",u.name+" comentou em sua publicação.",{postId:id});}
- r.json({comment:{...x.rows[0],name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)}});
-}catch(e){console.error(e);r.status(500).json({error:"Não foi possível comentar."})}});
-app.post("/api/feed/:id/save",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
- const exists=await pool.query("SELECT 1 FROM social_saves WHERE post_id=$1 AND user_id=$2",[id,u.id]);let saved;if(exists.rowCount){await pool.query("DELETE FROM social_saves WHERE post_id=$1 AND user_id=$2",[id,u.id]);saved=false}else{await pool.query("INSERT INTO social_saves(post_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[id,u.id]);saved=true}
- const c=await pool.query("SELECT COUNT(*)::int AS saves FROM social_saves WHERE post_id=$1",[id]);r.json({saved,saves:c.rows[0].saves});
-}catch(e){r.status(500).json({error:"Não foi possível salvar a publicação."})}});
 
 app.get("/api/notifications",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const x=await pool.query("SELECT id,type,title,body,data,read_at,created_at FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50",[u.id]);const unread=x.rows.filter(n=>!n.read_at).length;r.json({notifications:x.rows,unread})}catch(e){r.status(500).json({error:"Erro ao carregar notificações."})}});
 app.post("/api/notifications/read",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;await pool.query("UPDATE notifications SET read_at=NOW() WHERE user_id=$1 AND read_at IS NULL",[u.id]);r.json({ok:true})}catch(e){r.status(500).json({error:"Erro ao marcar notificações."})}});
@@ -553,7 +548,7 @@ async function getFriendForDM(me,code){
  return {other};
 }
 const mediaSecret=String(process.env.SESSION_SECRET||process.env.DATABASE_URL||crypto.randomBytes(32).toString("hex"));
-function makeMediaToken(messageId,userId){const exp=Math.floor(Date.now()/1000)+60*30;const raw=`${messageId}.${userId}.${exp}`;const sig=crypto.createHmac("sha256",mediaSecret).update(raw).digest("base64url");return Buffer.from(`${raw}.${sig}`).toString("base64url");}
+function makeMediaToken(messageId,userId){const exp=Math.floor(Date.now()/1000)+60*60*24*7;const raw=`${messageId}.${userId}.${exp}`;const sig=crypto.createHmac("sha256",mediaSecret).update(raw).digest("base64url");return Buffer.from(`${raw}.${sig}`).toString("base64url");}
 function verifyMediaToken(token,messageId,userId){try{const raw=Buffer.from(String(token||""),"base64url").toString();const parts=raw.split(".");if(parts.length!==4)return false;const [mid,uid,exp,sig]=parts;if(Number(mid)!==Number(messageId)||Number(uid)!==Number(userId)||Number(exp)<Math.floor(Date.now()/1000))return false;const expected=crypto.createHmac("sha256",mediaSecret).update(`${mid}.${uid}.${exp}`).digest("base64url");return crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(expected));}catch(e){return false}}
 function messagePublic(row,viewerId){return {id:row.id,sender_id:row.sender_id,receiver_id:row.receiver_id,body:row.body||"",created_at:row.created_at,read_at:row.read_at,media:row.media_id?{id:row.media_id,type:row.media_type,name:row.media_name,mime:row.media_mime,size:Number(row.media_size||0),duration:Number(row.media_duration||0),url:"/api/messages/media/"+row.media_id+"?mt="+encodeURIComponent(makeMediaToken(row.media_id,viewerId))}:null};}
 app.get("/api/messages/unread",async(q,r)=>{
@@ -718,17 +713,17 @@ io.on("connection",s=>{
  s.on("call-end",({room})=>{if(room!==s.data.room||calls.get(room)!==s.id)return;calls.delete(room);callReady.delete(room);roomMusic.delete(room);io.to(room).emit("call-ended");io.to(room).emit("call-state",{active:false,host:null,ready:[]});io.to(room).emit("music-stop");io.to(room).emit("system",s.data.name+" encerrou a call.");broadcast(room)});
  function musicStateFor(room){const st=roomMusic.get(room);if(!st)return null;const position=st.paused?Number(st.position||0):Math.max(0,Number(st.position||0)+(Date.now()-Number(st.startedAt||Date.now()))/1000);return {...st,position};}
  function cleanMusicTrack(t){const x={id:String(t?.id||"").replace(/[^A-Za-z0-9_-]/g,"").slice(0,80),title:String(t?.title||"Sem título").slice(0,120),artist:String(t?.artist||"Artista desconhecido").slice(0,80),duration:Number(t?.duration||0)};return x.id?x:null;}
- function musicParticipant(s,room){return room===s.data.room&&calls.has(room)&&ready(room).has(s.id);}
- function musicController(s,room){return room===s.data.room&&calls.get(room)===s.id&&ready(room).has(s.id);}
- // Recusa silenciosa deixava o usuário sem saber por que o botão não fez nada.
- function denyMusicControl(s){s.emit("music-command-error","Só o criador da call pode controlar a música.");return false;}
- s.on("music-play",({room,track})=>{if(!musicParticipant(s,room)){s.emit("music-command-error","Entre em uma call ativa para usar o bot de música.");return;}const clean=cleanMusicTrack(track);if(!clean)return;let st=roomMusic.get(room);if(st){if(st.queue.length>=50){s.emit("music-command-error","A fila está cheia (máximo 50).");return;}st.queue.push(clean);io.to(room).emit("music-state",musicStateFor(room));io.to(room).emit("system",s.data.name+" adicionou 🎵 "+clean.title+" à fila.");return;}st={track:clean,queue:[],hostId:s.id,startedAt:Date.now(),position:0,paused:false,volume:.7};roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));io.to(room).emit("system",s.data.name+" colocou 🎵 "+clean.title+" para tocar.");});
- s.on("music-next",({room})=>{if(!musicController(s,room))return denyMusicControl(s);const st=roomMusic.get(room);if(!st)return;const n=st.queue.shift();if(n){st.track=n;st.startedAt=Date.now();st.position=0;st.paused=false;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));}else{roomMusic.delete(room);io.to(room).emit("music-stop");io.to(room).emit("system","🎵 A fila terminou.");}});
- s.on("music-pause",({room})=>{if(!musicController(s,room))return denyMusicControl(s);const st=roomMusic.get(room);if(!st||st.paused)return;st.position=musicStateFor(room).position;st.paused=true;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));});
- s.on("music-resume",({room})=>{if(!musicController(s,room))return denyMusicControl(s);const st=roomMusic.get(room);if(!st?.paused)return;st.startedAt=Date.now();st.paused=false;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));});
- s.on("music-volume",({room,volume})=>{if(!musicController(s,room))return denyMusicControl(s);const st=roomMusic.get(room);if(!st)return;st.volume=Math.max(0,Math.min(1,Number(volume)||0));roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));});
- s.on("music-queue",({room})=>{if(room!==s.data.room)return;const q=roomMusic.get(room)?.queue||[];s.emit("system",q.length?"🎵 Fila ("+q.length+"):\n"+q.slice(0,15).map((x,i)=>(i+1)+". "+x.title+" — "+x.artist).join("\n"):"🎵 A fila está vazia.");});
- s.on("music-stop",({room})=>{if(!musicController(s,room))return denyMusicControl(s);roomMusic.delete(room);io.to(room).emit("music-stop");io.to(room).emit("system",s.data.name+" parou a música e limpou a fila.");});
+ function musicParticipant(s,room){return room===s.data.room&&calls.has(room);}
+ function musicController(s,room){return room===s.data.room&&calls.get(room)===s.id;}
+ // Confirmação explícita dos comandos evita falsos "sucessos" no painel.
+ function denyMusicControl(s,ack){const msg="Só o criador da call pode controlar a música.";s.emit("music-command-error",msg);if(typeof ack==="function")ack({ok:false,error:msg});return false;}
+ s.on("music-play",({room,track},ack)=>{if(!musicParticipant(s,room)){const msg="Entre em uma call ativa para usar o bot de música.";s.emit("music-command-error",msg);if(typeof ack==="function")ack({ok:false,error:msg});return;}const clean=cleanMusicTrack(track);if(!clean){const msg="Faixa inválida. Escolha uma música válida.";s.emit("music-command-error",msg);if(typeof ack==="function")ack({ok:false,error:msg});return;}let st=roomMusic.get(room);if(st){if(st.queue.length>=50){const msg="A fila está cheia (máximo 50).";s.emit("music-command-error",msg);if(typeof ack==="function")ack({ok:false,error:msg});return;}st.queue.push(clean);io.to(room).emit("music-state",musicStateFor(room));io.to(room).emit("system",s.data.name+" adicionou 🎵 "+clean.title+" à fila.");if(typeof ack==="function")ack({ok:true,queued:true,track:clean});return;}st={track:clean,queue:[],hostId:s.id,startedAt:Date.now(),position:0,paused:false,volume:.7};roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));io.to(room).emit("system",s.data.name+" colocou 🎵 "+clean.title+" para tocar.");if(typeof ack==="function")ack({ok:true,queued:false,track:clean});});
+ s.on("music-next",({room},ack)=>{if(!musicController(s,room))return denyMusicControl(s,ack);const st=roomMusic.get(room);if(!st){if(typeof ack==="function")ack({ok:true,stopped:true});return;}const n=st.queue.shift();if(n){st.track=n;st.startedAt=Date.now();st.position=0;st.paused=false;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));if(typeof ack==="function")ack({ok:true,track:n});}else{roomMusic.delete(room);io.to(room).emit("music-stop");io.to(room).emit("system","🎵 A fila terminou.");if(typeof ack==="function")ack({ok:true,stopped:true});}});
+ s.on("music-pause",({room},ack)=>{if(!musicController(s,room))return denyMusicControl(s,ack);const st=roomMusic.get(room);if(!st){if(typeof ack==="function")ack({ok:true});return;}if(st.paused){if(typeof ack==="function")ack({ok:true,already:true});return;}st.position=musicStateFor(room).position;st.paused=true;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));if(typeof ack==="function")ack({ok:true});});
+ s.on("music-resume",({room},ack)=>{if(!musicController(s,room))return denyMusicControl(s,ack);const st=roomMusic.get(room);if(!st){if(typeof ack==="function")ack({ok:true});return;}if(!st.paused){if(typeof ack==="function")ack({ok:true,already:true});return;}st.startedAt=Date.now();st.paused=false;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));if(typeof ack==="function")ack({ok:true});});
+ s.on("music-volume",({room,volume},ack)=>{if(!musicController(s,room))return denyMusicControl(s,ack);const st=roomMusic.get(room);if(!st){const msg="Nenhuma música está tocando.";if(typeof ack==="function")ack({ok:false,error:msg});return;}st.volume=Math.max(0,Math.min(1,Number(volume)||0));roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));if(typeof ack==="function")ack({ok:true,volume:st.volume});});
+ s.on("music-queue",({room},ack)=>{if(room!==s.data.room){if(typeof ack==="function")ack({ok:false,error:"Sala inválida."});return;}const q=roomMusic.get(room)?.queue||[];s.emit("system",q.length?"🎵 Fila ("+q.length+"):\n"+q.slice(0,15).map((x,i)=>(i+1)+". "+x.title+" — "+x.artist).join("\n"):"🎵 A fila está vazia.");if(typeof ack==="function")ack({ok:true,queue:q});});
+ s.on("music-stop",({room},ack)=>{if(!musicController(s,room))return denyMusicControl(s,ack);roomMusic.delete(room);io.to(room).emit("music-stop");io.to(room).emit("system",s.data.name+" parou a música e limpou a fila.");if(typeof ack==="function")ack({ok:true});});
  s.on("signal",({to,data})=>{
    const rm=s.data.room;
    if(!rm||!to||!data||!valid(s,to)||!calls.has(rm))return;
@@ -771,7 +766,7 @@ const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(
 setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
 const PORT=Number(process.env.PORT)||3000;
 server.listen(PORT,"0.0.0.0",()=>{
-  console.log("FreeChat v1.0.0 server ativo na porta "+PORT);
+  console.log("FreeChat v1.1.0 server ativo na porta "+PORT);
   initDbWithRetry();
 });
 async function initDbWithRetry(){
