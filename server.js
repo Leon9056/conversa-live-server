@@ -21,7 +21,13 @@ const server=http.createServer(app);
 server.keepAliveTimeout=120000;
 server.headersTimeout=125000;
 const io=new Server(server,{path:"/socket.io",addTrailingSlash:false,cors:{origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST"],credentials:false},transports:["polling","websocket"],allowEIO3:true,connectTimeout:10000});
-const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL?{rejectUnauthorized:false}:false});
+const pool=new Pool({
+  connectionString:process.env.DATABASE_URL,
+  ssl:process.env.DATABASE_URL?{rejectUnauthorized:false}:false,
+  connectionTimeoutMillis:10000,
+  idleTimeoutMillis:30000,
+  max:10
+});
 pool.on("error",e=>console.error("PostgreSQL pool error:",e?.message||e));
 let dbReady=false;
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024},fileFilter:(req,file,cb)=>{const mime=/^(image\/(jpeg|png|webp|gif)|video\/(mp4|webm|quicktime|ogg))$/i.test(file.mimetype);const name=String(file.originalname||"").normalize("NFKC");const ext=(name.match(/\.([A-Za-z0-9]{1,8})$/)||[])[1]?.toLowerCase();const allowed=(file.mimetype.startsWith("image/")?{jpeg:"image/jpeg",jpg:"image/jpeg",png:"image/png",webp:"image/webp",gif:"image/gif"}:{mp4:"video/mp4",webm:"video/webm",mov:"video/quicktime",ogg:"video/ogg",oga:"video/ogg"});const ok=!!ext&&mime&&allowed[ext]===file.mimetype.toLowerCase()&&!/\.(php|phtml|js|html|svg|exe|bat|cmd|sh)(\.|$)/i.test(name);cb(ok?null:new Error("Arquivo não permitido. Use uma imagem JPG/PNG/WEBP/GIF ou vídeo MP4/WebM/MOV/OGG."),ok)}});
@@ -157,6 +163,26 @@ async function initDb(){
  await pool.query(`CREATE TABLE IF NOT EXISTS blocked_users(user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,blocked_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(user_id,blocked_id))`);
  await pool.query(`CREATE TABLE IF NOT EXISTS reports(id BIGSERIAL PRIMARY KEY,reporter_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,target_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,reason VARCHAR(64) NOT NULL,details VARCHAR(1000),status VARCHAR(16) NOT NULL DEFAULT 'open',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
  await pool.query(`CREATE TABLE IF NOT EXISTS user_privacy(user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,message_policy VARCHAR(16) NOT NULL DEFAULT 'friends',call_policy VARCHAR(16) NOT NULL DEFAULT 'friends',friend_policy VARCHAR(16) NOT NULL DEFAULT 'everyone')`);
+ await pool.query(`ALTER TABLE user_privacy ADD COLUMN IF NOT EXISTS random_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS random_queue(
+   user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+   joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+   last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ )`);
+ await pool.query("ALTER TABLE random_queue ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()");
+ await pool.query(`CREATE INDEX IF NOT EXISTS random_queue_joined_idx ON random_queue(joined_at)`);
+ await pool.query(`CREATE INDEX IF NOT EXISTS random_queue_seen_idx ON random_queue(last_seen_at)`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS random_matches(
+   match_id VARCHAR(32) PRIMARY KEY,
+   user_a BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   user_b BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   room VARCHAR(64) NOT NULL,
+   status VARCHAR(16) NOT NULL DEFAULT 'active',
+   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+   expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW()+INTERVAL '10 minutes')
+ )`);
+ await pool.query("CREATE INDEX IF NOT EXISTS random_matches_user_idx ON random_matches(user_a,user_b,status,created_at DESC)");
+ await pool.query("CREATE INDEX IF NOT EXISTS random_matches_exp_idx ON random_matches(status,expires_at)");
 
  await pool.query(`CREATE TABLE IF NOT EXISTS communities(
    id BIGSERIAL PRIMARY KEY,
@@ -325,6 +351,7 @@ async function getSession(t){
   return sess;
 }
 async function auth(req,res){
+  if(!dbReady){res.status(503).json({error:"O servidor ainda está inicializando o banco de dados. Tente novamente em alguns segundos.",code:"DATABASE_NOT_READY"});return null;}
   const raw=String(req.headers.authorization||"");
   const t=raw.startsWith("Bearer ")?raw.slice(7).trim():"";
   const sess=await getSession(t);
@@ -348,129 +375,165 @@ async function auth(req,res){
 
 function cleanCommunityName(v){return String(v??"").replace(/\s+/g," ").trim().slice(0,48)}
 function cleanCommunityDesc(v){return String(v??"").replace(/\s+/g," ").trim().slice(0,180)}
+function cleanChannelName(v){return String(v??"").replace(/\s+/g," ").trim().slice(0,32)}
 function communityCode(){const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";let out="FR-";for(let i=0;i<8;i++)out+=chars[crypto.randomInt(chars.length)];return out}
 async function isCommunityMember(userId,communityId){
- const x=await pool.query("SELECT role FROM community_members WHERE community_id=$1 AND user_id=$2 LIMIT 1",[communityId,userId]);
+ const x=await pool.query("SELECT role FROM community_members WHERE community_id=$1 AND user_id=$2 LIMIT 1",[userId,communityId]);
  return x.rows[0]||null;
 }
 async function communitySummary(row,userId){
- return {id:Number(row.id),name:row.name,description:row.description||"",is_public:!!row.is_public,invite_code:Number(row.owner_id)===Number(userId)?row.invite_code:null,owner_id:Number(row.owner_id),member_count:Number(row.member_count||0),joined:!!row.joined,role:row.role||null};
+ return {id:Number(row.id),name:row.name,description:row.description||"",is_public:!!row.is_public,invite_code:Number(row.owner_id)===Number(userId)?row.invite_code:null,owner_id:Number(row.owner_id),member_count:Number(row.member_count||0),joined:!!row.joined,role:row.role||null,created_at:row.created_at};
 }
 app.get("/api/servers",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
- const mine=await pool.query(`SELECT c.*,COUNT(cm2.user_id)::int AS member_count,EXISTS(SELECT 1 FROM community_members cm WHERE cm.community_id=c.id AND cm.user_id=$1) AS joined,
+ const search=String(q.query?.q||"").replace(/\s+/g," ").trim().slice(0,60);
+ const like=`%${search}%`;
+ const mine=await pool.query(`SELECT c.*,COUNT(cm2.user_id)::int AS member_count,TRUE AS joined,
    (SELECT role FROM community_members cm3 WHERE cm3.community_id=c.id AND cm3.user_id=$1 LIMIT 1) AS role
    FROM communities c LEFT JOIN community_members cm2 ON cm2.community_id=c.id
    WHERE EXISTS(SELECT 1 FROM community_members cm4 WHERE cm4.community_id=c.id AND cm4.user_id=$1)
-   GROUP BY c.id ORDER BY c.created_at DESC LIMIT 100`,[u.id]);
+     AND ($2='' OR c.name ILIKE $3 OR c.description ILIKE $3)
+   GROUP BY c.id ORDER BY c.created_at DESC LIMIT 100`,[u.id,search,like]);
  const discover=await pool.query(`SELECT c.*,COUNT(cm2.user_id)::int AS member_count,FALSE AS joined,NULL::text AS role
    FROM communities c LEFT JOIN community_members cm2 ON cm2.community_id=c.id
    WHERE c.is_public=TRUE AND NOT EXISTS(SELECT 1 FROM community_members cm WHERE cm.community_id=c.id AND cm.user_id=$1)
-   GROUP BY c.id ORDER BY c.created_at DESC LIMIT 50`,[u.id]);
- r.json({mine:mine.rows.map(x=>communitySummary(x,u.id)),discover:discover.rows.map(x=>communitySummary(x,u.id))});
+     AND ($2='' OR c.name ILIKE $3 OR c.description ILIKE $3)
+   GROUP BY c.id ORDER BY member_count DESC,c.created_at DESC LIMIT 100`,[u.id,search,like]);
+ r.json({mine:mine.rows.map(x=>communitySummary(x,u.id)),discover:discover.rows.map(x=>communitySummary(x,u.id)),query:search});
 }catch(e){console.error("servers-list",e);r.status(500).json({error:"Não foi possível carregar os servidores."})}});
 
 app.post("/api/servers",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
- if(!rateLimit("server-create:"+u.id,5,10*60*1000))return r.status(429).json({error:"Você criou muitos servidores recentemente. Aguarde."});
+ if(!rateLimit("server-create:"+u.id,5,10*60*1000))return r.status(429).json({error:"Você criou muitos servidores recentemente. Aguarde alguns minutos."});
  const name=cleanCommunityName(q.body?.name),description=cleanCommunityDesc(q.body?.description),isPublic=q.body?.isPublic!==false;
  if(name.length<2)return r.status(400).json({error:"O nome do servidor precisa ter pelo menos 2 caracteres."});
+ const count=await pool.query("SELECT COUNT(*)::int AS n FROM community_members WHERE user_id=$1 AND role='owner'",[u.id]);
+ if(Number(count.rows[0]?.n||0)>=20)return r.status(400).json({error:"Você atingiu o limite de 20 servidores criados."});
  let created=null;
- for(let i=0;i<5&&!created;i++){const invite=communityCode();try{
-   const x=await pool.query("INSERT INTO communities(owner_id,name,description,is_public,invite_code) VALUES($1,$2,$3,$4,$5) RETURNING *",[u.id,name,description,isPublic,invite]);
-   created=x.rows[0];
+ for(let i=0;i<8&&!created;i++){const invite=communityCode();try{
+   const client=await pool.connect();
+   try{await client.query("BEGIN");const x=await client.query("INSERT INTO communities(owner_id,name,description,is_public,invite_code) VALUES($1,$2,$3,$4,$5) RETURNING *",[u.id,name,description,isPublic,invite]);created=x.rows[0];
+     await client.query("INSERT INTO community_members(community_id,user_id,role) VALUES($1,$2,'owner')",[created.id,u.id]);
+     await client.query("INSERT INTO community_channels(community_id,name,type) VALUES($1,'geral','text'),($1,'Sala de voz','voice')",[created.id]);await client.query("COMMIT");
+   }catch(e){try{await client.query("ROLLBACK")}catch(_){} if(e?.code!=="23505")throw e}finally{client.release()}
  }catch(e){if(e?.code!=="23505")throw e;}}
- if(!created)return r.status(500).json({error:"Não foi possível gerar o convite do servidor."});
- await pool.query("INSERT INTO community_members(community_id,user_id,role) VALUES($1,$2,'owner')",[created.id,u.id]);
- await pool.query("INSERT INTO community_channels(community_id,name,type) VALUES($1,'geral','text'),($1,'Sala de voz','voice')",[created.id]);
+ if(!created)return r.status(500).json({error:"Não foi possível gerar um convite único. Tente novamente."});
  await securityEvent(u.id,"COMMUNITY_CREATED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{communityId:created.id}});
- r.json({server:{id:Number(created.id),name:created.name,description:created.description,is_public:created.is_public,invite_code:created.invite_code}});
+ r.status(201).json({server:{id:Number(created.id),name:created.name,description:created.description,is_public:created.is_public,invite_code:created.invite_code}});
 }catch(e){console.error("server-create",e);r.status(500).json({error:"Não foi possível criar o servidor."})}});
 
 app.post("/api/servers/join",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
- const invite=String(q.body?.inviteCode||"").trim().toUpperCase().slice(0,16);
- if(!/^FR-[A-Z0-9]{8}$/.test(invite))return r.status(400).json({error:"Código de convite inválido."});
- const x=await pool.query("SELECT id,name FROM communities WHERE invite_code=$1 LIMIT 1",[invite]);if(!x.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
- await pool.query("INSERT INTO community_members(community_id,user_id,role) VALUES($1,$2,'member') ON CONFLICT DO NOTHING",[x.rows[0].id,u.id]);
- r.json({server:{id:Number(x.rows[0].id),name:x.rows[0].name}});
+ const invite=String(q.body?.inviteCode||"").trim().toUpperCase().replace(/\s+/g,"").slice(0,16);
+ if(!/^FR-[A-Z0-9]{8}$/.test(invite))return r.status(400).json({error:"Código de convite inválido. Use FR-XXXXXXXX."});
+ const x=await pool.query("SELECT id,name,is_public FROM communities WHERE invite_code=$1 LIMIT 1",[invite]);if(!x.rowCount)return r.status(404).json({error:"Servidor não encontrado ou convite expirado."});
+ await pool.query("INSERT INTO community_members(community_id,user_id,role) VALUES($1,$2,'member') ON CONFLICT(community_id,user_id) DO NOTHING",[x.rows[0].id,u.id]);
+ r.json({ok:true,server:{id:Number(x.rows[0].id),name:x.rows[0].name}});
 }catch(e){console.error("server-join",e);r.status(500).json({error:"Não foi possível entrar no servidor."})}});
 
 app.post("/api/servers/:id/join",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
  const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Servidor inválido."});
  const x=await pool.query("SELECT id,name,is_public FROM communities WHERE id=$1 LIMIT 1",[id]);if(!x.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
- if(!x.rows[0].is_public){
-   return r.status(403).json({error:"Este servidor é privado. Use um código de convite."});
- }
- await pool.query("INSERT INTO community_members(community_id,user_id,role) VALUES($1,$2,'member') ON CONFLICT DO NOTHING",[id,u.id]);
- r.json({ok:true,server:{id,name:x.rows[0].name}});
+ if(!x.rows[0].is_public)return r.status(403).json({error:"Este servidor é privado. Use um código de convite."});
+ await pool.query("INSERT INTO community_members(community_id,user_id,role) VALUES($1,$2,'member') ON CONFLICT(community_id,user_id) DO NOTHING",[id,u.id]);
+ r.json({ok:true,server:{id:Number(x.rows[0].id),name:x.rows[0].name}});
 }catch(e){console.error("server-join-id",e);r.status(500).json({error:"Não foi possível entrar no servidor."})}});
 
+app.post("/api/servers/:id/leave",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Servidor inválido."});
+ const owner=await pool.query("SELECT owner_id FROM communities WHERE id=$1 LIMIT 1",[id]);if(!owner.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
+ if(Number(owner.rows[0].owner_id)===Number(u.id))return r.status(400).json({error:"O proprietário não pode sair. Transfira a propriedade antes."});
+ const x=await pool.query("DELETE FROM community_members WHERE community_id=$1 AND user_id=$2 RETURNING community_id",[id,u.id]);
+ if(!x.rowCount)return r.status(400).json({error:"Você não participa deste servidor."});r.json({ok:true});
+}catch(e){console.error("server-leave",e);r.status(500).json({error:"Não foi possível sair do servidor."})}});
+
 app.get("/api/servers/:id",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;
- const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Servidor inválido."});
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Servidor inválido."});
  const member=await isCommunityMember(u.id,id);if(!member)return r.status(403).json({error:"Você não participa deste servidor."});
- const s=await pool.query("SELECT id,owner_id,name,description,is_public,invite_code FROM communities WHERE id=$1 LIMIT 1",[id]);if(!s.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
- const ch=await pool.query("SELECT id,name,type FROM community_channels WHERE community_id=$1 ORDER BY id",[id]);
+ const s=await pool.query("SELECT id,owner_id,name,description,is_public,invite_code,created_at FROM communities WHERE id=$1 LIMIT 1",[id]);if(!s.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
+ const ch=await pool.query("SELECT id,name,type FROM community_channels WHERE community_id=$1 ORDER BY CASE WHEN type='text' THEN 0 ELSE 1 END,id",[id]);
+ const mc=await pool.query("SELECT COUNT(*)::int AS n FROM community_members WHERE community_id=$1",[id]);
  const channels=ch.rows.map(c=>({id:Number(c.id),name:c.name,type:c.type,room_name:`srv-${id}-${c.id}`}));
- r.json({server:{id:Number(s.rows[0].id),owner_id:Number(s.rows[0].owner_id),name:s.rows[0].name,description:s.rows[0].description||"",is_public:!!s.rows[0].is_public,invite_code:Number(s.rows[0].owner_id)===Number(u.id)?s.rows[0].invite_code:null,role:member.role,channels}});
+ r.json({server:{id:Number(s.rows[0].id),owner_id:Number(s.rows[0].owner_id),name:s.rows[0].name,description:s.rows[0].description||"",is_public:!!s.rows[0].is_public,invite_code:Number(s.rows[0].owner_id)===Number(u.id)?s.rows[0].invite_code:null,role:member.role,member_count:Number(mc.rows[0]?.n||0),created_at:s.rows[0].created_at,channels}});
 }catch(e){console.error("server-detail",e);r.status(500).json({error:"Não foi possível carregar o servidor."})}});
 
 app.post("/api/servers/:id/channels",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;
- const id=Number(q.params.id),member=await isCommunityMember(u.id,id);if(!member||!["owner","admin"].includes(member.role))return r.status(403).json({error:"Você não tem permissão para criar canais."});
- const name=cleanCommunityName(q.body?.name),type=String(q.body?.type||"text");if(name.length<1||!["text","voice"].includes(type))return r.status(400).json({error:"Canal inválido."});
- const x=await pool.query("INSERT INTO community_channels(community_id,name,type) VALUES($1,$2,$3) RETURNING id,name,type",[id,name,type]);
- r.json({channel:{id:Number(x.rows[0].id),name:x.rows[0].name,type:x.rows[0].type,room_name:`srv-${id}-${x.rows[0].id}`}});
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),member=await isCommunityMember(u.id,id);if(!member||!['owner','admin'].includes(member.role))return r.status(403).json({error:"Você não tem permissão para criar canais."});
+ const name=cleanChannelName(q.body?.name),type=String(q.body?.type||"text");if(name.length<1||!["text","voice"].includes(type))return r.status(400).json({error:"Canal inválido."});
+ const count=await pool.query("SELECT COUNT(*)::int AS n FROM community_channels WHERE community_id=$1",[id]);if(Number(count.rows[0]?.n||0)>=50)return r.status(400).json({error:"Este servidor já atingiu o limite de 50 canais."});
+ const dup=await pool.query("SELECT 1 FROM community_channels WHERE community_id=$1 AND lower(name)=lower($2) LIMIT 1",[id,name]);if(dup.rowCount)return r.status(409).json({error:"Já existe um canal com esse nome."});
+ const x=await pool.query("INSERT INTO community_channels(community_id,name,type) VALUES($1,$2,$3) RETURNING id,name,type",[id,name,type]);r.status(201).json({channel:{id:Number(x.rows[0].id),name:x.rows[0].name,type:x.rows[0].type,room_name:`srv-${id}-${x.rows[0].id}`} });
 }catch(e){console.error("channel-create",e);r.status(500).json({error:"Não foi possível criar o canal."})}});
 
-/* Random matchmaking: processo local do servidor; sem serviço externo. */
-const randomQueue=new Map();
-const randomMatches=new Map();
+/* Random matchmaking: fila persistente e resultado persistente no PostgreSQL. */
 function randomRoomId(){return "random-"+crypto.randomBytes(8).toString("hex")}
-function clearRandomForUser(userId){
- const uid=Number(userId);randomQueue.delete(uid);
- for(const [mid,m] of randomMatches){if(Number(m.a.userId)===uid||Number(m.b.userId)===uid)randomMatches.delete(mid)}
+async function clearRandomForUser(userId){
+ const uid=Number(userId); if(!Number.isSafeInteger(uid)||uid<1)return;
+ try{await pool.query("DELETE FROM random_queue WHERE user_id=$1",[uid])}catch(e){console.error("random-clear",e?.message||e)}
+}
+async function activeRandomMatch(userId){
+ const uid=Number(userId);if(!Number.isSafeInteger(uid)||uid<1)return null;
+ const x=await pool.query(`SELECT rm.match_id,rm.room,rm.user_a,rm.user_b,ua.code AS a_code,ua.name AS a_name,ua.avatar_mime AS a_avatar_mime,ua.avatar_updated_at AS a_avatar_updated_at,ub.code AS b_code,ub.name AS b_name,ub.avatar_mime AS b_avatar_mime,ub.avatar_updated_at AS b_avatar_updated_at
+   FROM random_matches rm JOIN users ua ON ua.id=rm.user_a JOIN users ub ON ub.id=rm.user_b
+   WHERE (rm.user_a=$1 OR rm.user_b=$1) AND rm.status='active' AND rm.expires_at>NOW() ORDER BY rm.created_at DESC LIMIT 1`,[uid]);
+ if(!x.rowCount)return null;
+ const m=x.rows[0],a={userId:Number(m.user_a),code:m.a_code,name:m.a_name,avatarUrl:avatarUrlFor({code:m.a_code,avatar_mime:m.a_avatar_mime,avatar_updated_at:m.a_avatar_updated_at})},b={userId:Number(m.user_b),code:m.b_code,name:m.b_name,avatarUrl:avatarUrlFor({code:m.b_code,avatar_mime:m.b_avatar_mime,avatar_updated_at:m.b_avatar_updated_at})};
+ const partner=uid===a.userId?b:a;
+ return {matchId:m.match_id,room:m.room,...partner};
+}
+async function endRandomMatchesForUser(userId){
+ const uid=Number(userId);if(!Number.isSafeInteger(uid)||uid<1)return;
+ await pool.query("UPDATE random_matches SET status='ended' WHERE (user_a=$1 OR user_b=$1) AND status='active'",[uid]);
 }
 async function findRandomMatch(userId){
- const me=await getUserById(userId);if(!me)return null;
- const blocked=await pool.query("SELECT blocked_id FROM blocked_users WHERE user_id=$1",[userId]);
- const blockedSet=new Set(blocked.rows.map(x=>String(x.blocked_id)));
- const candidates=[...randomQueue.entries()].filter(([id,v])=>Number(id)!==Number(userId)&&Date.now()-v.joinedAt<10*60*1000&&!blockedSet.has(String(id)));
- for(const [otherId,other] of candidates.sort(()=>Math.random()-.5)){
-   const rev=await pool.query("SELECT 1 FROM blocked_users WHERE user_id=$1 AND blocked_id=$2 LIMIT 1",[otherId,userId]);
-   if(rev.rowCount)continue;
-   randomQueue.delete(Number(otherId));randomQueue.delete(Number(userId));
+ const uid=Number(userId); if(!Number.isSafeInteger(uid)||uid<1)return null;
+ const me=await getUserById(uid);if(!me)return null;
+ const existing=await activeRandomMatch(uid);if(existing)return existing;
+ const client=await pool.connect();let match=null;
+ try{
+   await client.query("BEGIN");
+   await client.query("DELETE FROM random_queue WHERE joined_at < NOW()-INTERVAL '10 minutes' OR last_seen_at < NOW()-INTERVAL '20 seconds'");
+   const candidate=await client.query(`
+     SELECT rq.user_id,rq.joined_at,u.code,u.name,u.avatar_mime,u.avatar_updated_at
+     FROM random_queue rq JOIN users u ON u.id=rq.user_id
+     JOIN user_privacy up ON up.user_id=rq.user_id
+     WHERE rq.user_id<>$1 AND rq.joined_at>=NOW()-INTERVAL '10 minutes' AND rq.last_seen_at>=NOW()-INTERVAL '20 seconds' AND up.random_enabled=TRUE
+       AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE b.user_id=$1 AND b.blocked_id=rq.user_id)
+       AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE b.user_id=rq.user_id AND b.blocked_id=$1)
+     ORDER BY rq.joined_at ASC FOR UPDATE OF rq SKIP LOCKED LIMIT 1`,[uid]);
+   if(!candidate.rowCount){await client.query("COMMIT");return null}
+   const other=candidate.rows[0];
+   await client.query("DELETE FROM random_queue WHERE user_id IN ($1,$2)",[uid,Number(other.user_id)]);
    const matchId=crypto.randomBytes(8).toString("hex"),room=randomRoomId();
-   const partnerOther={userId:Number(otherId),code:other.code,name:other.name,avatarUrl:avatarUrlFor(other)};
-   const partnerMe={userId:Number(userId),code:me.code,name:me.name,avatarUrl:avatarUrlFor(me)};
-   const match={a:partnerMe,b:partnerOther,room,matchId,createdAt:Date.now()};
-   randomMatches.set(matchId,match);
-   notifyUser(me.code,"random-match-found",{matchId,room,partner:partnerOther});
-   notifyUser(other.code,"random-match-found",{matchId,room,partner:partnerMe});
-   return {matchId,room,partner:partnerOther};
+   await client.query("INSERT INTO random_matches(match_id,user_a,user_b,room,status) VALUES($1,$2,$3,$4,'active')",[matchId,uid,Number(other.user_id),room]);
+   match={matchId,room,partnerOther:{userId:Number(other.user_id),code:other.code,name:other.name,avatarUrl:avatarUrlFor(other)}};
+   await client.query("COMMIT");
+ }catch(e){try{await client.query("ROLLBACK")}catch(_){}throw e}finally{client.release()}
+ if(match){
+   notifyUser(me.code,"random-match-found",{matchId:match.matchId,room:match.room,partner:match.partnerOther});
+   notifyUser(match.partnerOther.code,"random-match-found",{matchId:match.matchId,room:match.room,partner:{userId:uid,code:me.code,name:me.name,avatarUrl:avatarUrlFor(me)}});
+   return {matchId:match.matchId,room:match.room,...match.partnerOther};
  }
  return null;
 }
 app.post("/api/random/queue",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
- if(!rateLimit("random:"+u.id,20,60*1000))return r.status(429).json({error:"Muitas tentativas de conexão. Aguarde um pouco."});
- const p=await privacyFor(u.id);
- if(!p.random_enabled)return r.status(403).json({error:"Ative Conhecer alguém nas configurações de privacidade antes de entrar na fila."});
- if(p.call_policy==="nobody")return r.status(403).json({error:"Suas configurações de chamadas não permitem essa função."});
- clearRandomForUser(u.id);
- const match=await findRandomMatch(u.id);
- if(match)return r.json({ok:true,match:{matchId:match.matchId,room:match.room,...match.partner}});
- randomQueue.set(Number(u.id),{code:u.code,name:u.name,avatarUrl:avatarUrlFor(u),joinedAt:Date.now()});
- r.json({ok:true,waiting:true});
-}catch(e){console.error("random-queue",e);r.status(500).json({error:"Não foi possível entrar na fila."})}});
+ if(!rateLimit("random:"+u.id,30,60*1000))return r.status(429).json({error:"Muitas tentativas de conexão. Aguarde um pouco."});
+ const p=await privacyFor(u.id);if(!p.random_enabled)return r.status(403).json({error:"Ative Conhecer alguém nas configurações de privacidade antes de entrar na fila.",code:"RANDOM_DISABLED"});
+ const existing=await activeRandomMatch(u.id);if(existing)return r.json({ok:true,match:existing});
+ await pool.query("INSERT INTO random_queue(user_id,joined_at,last_seen_at) VALUES($1,NOW(),NOW()) ON CONFLICT(user_id) DO UPDATE SET last_seen_at=NOW()",[u.id]);
+ const match=await findRandomMatch(u.id);if(match)return r.json({ok:true,match});
+ r.json({ok:true,waiting:true,position:null});
+}catch(e){console.error("random-queue",e);r.status(500).json({error:"Não foi possível entrar na fila. Tente novamente em alguns segundos."})}});
+app.post("/api/random/leave",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;await clearRandomForUser(u.id);await endRandomMatchesForUser(u.id);r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível cancelar a fila."})}});
+app.post("/api/random/next",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;await endRandomMatchesForUser(u.id);await clearRandomForUser(u.id);
+ const p=await privacyFor(u.id);if(!p.random_enabled)return r.status(403).json({error:"Ative Conhecer alguém nas configurações de privacidade.",code:"RANDOM_DISABLED"});
+ await pool.query("INSERT INTO random_queue(user_id,joined_at,last_seen_at) VALUES($1,NOW(),NOW()) ON CONFLICT(user_id) DO UPDATE SET joined_at=NOW(),last_seen_at=NOW()",[u.id]);
+ const match=await findRandomMatch(u.id);if(match)return r.json({ok:true,match});r.json({ok:true,waiting:true});
+}catch(e){console.error("random-next",e);r.status(500).json({error:"Não foi possível procurar outra pessoa."})}});
 
-app.post("/api/random/leave",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;clearRandomForUser(u.id);r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível cancelar a fila."})}});
-
-app.post("/api/random/next",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;clearRandomForUser(u.id);const match=await findRandomMatch(u.id);if(match)return r.json({ok:true,match:{matchId:match.matchId,room:match.room,...match.partner}});randomQueue.set(Number(u.id),{code:u.code,name:u.name,avatarUrl:avatarUrlFor(u),joinedAt:Date.now()});r.json({ok:true,waiting:true})}catch(e){r.status(500).json({error:"Não foi possível procurar outra pessoa."})}});
-
-app.get("/",(_,r)=>r.send("FreeChat server OK — v1.5.0 PostgreSQL + música"));
 app.get("/health",async(_,r)=>{
   if(!dbReady)return r.status(503).json({ok:false,database:false,version:"1.5.0",service:"conversa-live-server"});
   try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.5.0",service:"conversa-live-server"})}
@@ -1097,9 +1160,7 @@ setInterval(async()=>{
  for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);
  for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);
  for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);
- for(const [id,v] of randomQueue)if(now-v.joinedAt>10*60*1000)randomQueue.delete(id);
- for(const [mid,m] of randomMatches)if(now-m.createdAt>30*60*1000)randomMatches.delete(mid);
- try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()");await pool.query("DELETE FROM email_tokens WHERE expires_at<NOW() OR (used_at IS NOT NULL AND created_at<NOW()-INTERVAL '7 days')")}catch(e){}
+ try{await pool.query("DELETE FROM random_queue WHERE joined_at < NOW()-INTERVAL '10 minutes' OR last_seen_at < NOW()-INTERVAL '30 seconds'");await pool.query("UPDATE random_matches SET status='expired' WHERE status='active' AND expires_at<NOW()");await pool.query("DELETE FROM random_matches WHERE status<>'active' AND created_at<NOW()-INTERVAL '1 day'");await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()");await pool.query("DELETE FROM email_tokens WHERE expires_at<NOW() OR (used_at IS NOT NULL AND created_at<NOW()-INTERVAL '7 days')")}catch(e){}
 },30*60*1000);
 const PORT=Number(process.env.PORT)||3000;
 server.listen(PORT,"0.0.0.0",()=>{
