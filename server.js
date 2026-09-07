@@ -12,7 +12,7 @@ function allowOrigin(origin){
   if(/^http:\/\/(localhost|127\.0\.0\.1)(?::\d+)?$/i.test(origin))return true;
   return false;
 }
-const corsOptions={origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST","OPTIONS"],credentials:false};
+const corsOptions={origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST","PATCH","PUT","DELETE","OPTIONS"],credentials:false};
 app.use(cors(corsOptions));
 app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.setHeader("X-Frame-Options","DENY");res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");res.setHeader("Permissions-Policy","camera=(self), microphone=(self), display-capture=(self)");res.setHeader("Cross-Origin-Opener-Policy","same-origin");res.setHeader("Cross-Origin-Resource-Policy","cross-origin");res.setHeader("Content-Security-Policy","default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https: wss:; script-src 'self' https://cdn.socket.io; style-src 'self' 'unsafe-inline'; font-src 'self' data: https:; form-action 'self'");if(req.secure||req.headers["x-forwarded-proto"]==="https")res.setHeader("Strict-Transport-Security","max-age=31536000; includeSubDomains");next()});
 app.use(express.json({limit:"32kb"}));
@@ -588,10 +588,11 @@ app.get("/api/feed",async(q,r)=>{try{
  const limit=Math.min(Math.max(Number(q.query.limit)||12,1),24);
  const offset=Math.min(Math.max(Number(q.query.offset)||0,0),10000);
  const filter=String(q.query.filter||"recent");
- // "friends": só publicações de amigos (exclui as suas). "recent" (padrão): você + amigos por recência.
+ // O feed principal é público para qualquer usuário autenticado.
+ // O filtro "friends" continua disponível como uma visão opcional somente de amigos.
  const scopeSql=filter==="friends"
    ? "p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1)"
-   : "p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1)";
+   : "TRUE";
  const x=await pool.query(`SELECT p.id,p.body,p.created_at,p.media_type,p.media_name,p.media_mime,p.media_size,p.media_duration,
    CASE WHEN p.media_data IS NOT NULL THEN p.id END AS media_id,
    u.id AS author_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,
@@ -607,11 +608,11 @@ app.get("/api/feed",async(q,r)=>{try{
 }catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar o feed."})}});
 
 async function canViewFeedPost(viewerId,postId){
- const x=await pool.query(`SELECT p.author_id, EXISTS(SELECT 1 FROM friendships f WHERE f.user_id=$1 AND f.friend_id=p.author_id) AS is_friend
-   FROM social_posts p WHERE p.id=$2 LIMIT 1`,[viewerId,postId]);
+ // Publicações do feed são públicas dentro do FreeChat para usuários autenticados.
+ // A autenticação continua obrigatória para evitar acesso anônimo às ações da rede social.
+ const x=await pool.query(`SELECT author_id FROM social_posts WHERE id=$1 LIMIT 1`,[postId]);
  if(!x.rowCount)return null;
- const row=x.rows[0];
- return Number(row.author_id)===Number(viewerId)||!!row.is_friend?Number(row.author_id):false;
+ return Number(x.rows[0].author_id);
 }
 app.post("/api/feed/:id/like",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
@@ -991,16 +992,22 @@ async function areFriends(a,b){return (await pool.query("SELECT 1 FROM friendshi
 async function isBlocked(a,b){return (await pool.query("SELECT 1 FROM blocked_users WHERE (user_id=$1 AND blocked_id=$2) OR (user_id=$2 AND blocked_id=$1) LIMIT 1",[a,b])).rowCount>0}
 async function canContact(targetId,meId,policy){if(await isBlocked(targetId,meId))return false;if(policy==="everyone")return true;if(policy==="nobody")return false;return areFriends(targetId,meId)}
 app.get("/api/security/privacy",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;r.json(await privacyFor(u.id))}catch(e){r.status(500).json({error:"Não foi possível carregar a privacidade."})}});
-app.patch("/api/security/privacy",async(q,r)=>{try{
+async function updatePrivacy(q,r){
  const u=await auth(q,r);if(!u)return;
  const allowed=["everyone","friends","nobody"];
- const m=String(q.body?.message_policy||"friends"),c=String(q.body?.call_policy||"friends"),f=String(q.body?.friend_policy||"everyone");
- const randomEnabled=q.body?.random_enabled===true;
+ const current=await privacyFor(u.id);
+ const m=q.body?.message_policy===undefined?current.message_policy:String(q.body.message_policy);
+ const c=q.body?.call_policy===undefined?current.call_policy:String(q.body.call_policy);
+ const f=q.body?.friend_policy===undefined?current.friend_policy:String(q.body.friend_policy);
+ const randomEnabled=q.body?.random_enabled===undefined?!!current.random_enabled:q.body.random_enabled===true;
  if(!allowed.includes(m)||!allowed.includes(c)||!allowed.includes(f))return r.status(400).json({error:"Configuração de privacidade inválida."});
  await pool.query("INSERT INTO user_privacy(user_id,message_policy,call_policy,friend_policy,random_enabled) VALUES($1,$2,$3,$4,$5) ON CONFLICT(user_id) DO UPDATE SET message_policy=EXCLUDED.message_policy,call_policy=EXCLUDED.call_policy,friend_policy=EXCLUDED.friend_policy,random_enabled=EXCLUDED.random_enabled",[u.id,m,c,f,randomEnabled]);
+ if(!randomEnabled) await clearRandomForUser(u.id);
  await securityEvent(u.id,"PRIVACY_UPDATED",{ip:requestIp(q),ua:q.headers["user-agent"]});
  r.json({message_policy:m,call_policy:c,friend_policy:f,random_enabled:randomEnabled});
-}catch(e){r.status(500).json({error:"Não foi possível salvar a privacidade."})}});
+}
+app.post("/api/security/privacy",async(q,r)=>{try{await updatePrivacy(q,r)}catch(e){console.error("privacy-update-post",e);if(!r.headersSent)r.status(500).json({error:"Não foi possível salvar a privacidade."})}});
+app.patch("/api/security/privacy",async(q,r)=>{try{await updatePrivacy(q,r)}catch(e){console.error("privacy-update-patch",e);if(!r.headersSent)r.status(500).json({error:"Não foi possível salvar a privacidade."})}});
 
 app.get("/api/security/blocked",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const x=await pool.query("SELECT u.name,u.code FROM blocked_users b JOIN users u ON u.id=b.blocked_id WHERE b.user_id=$1 ORDER BY b.created_at DESC",[u.id]);r.json({blocked:x.rows})}catch(e){r.status(500).json({error:"Não foi possível carregar bloqueios."})}});
 app.post("/api/security/block",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const target=await getUserByCode(q.body?.code);if(!target||Number(target.id)===Number(u.id))return r.status(400).json({error:"Usuário inválido."});await pool.query("INSERT INTO blocked_users(user_id,blocked_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,target.id]);await securityEvent(u.id,"USER_BLOCKED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{target:target.code}});r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível bloquear."})}});
@@ -1152,7 +1159,7 @@ io.on("connection",s=>{
    pendingSignals.delete(s.id);
    for(const [target,q] of pendingSignals){const filtered=q.filter(x=>x.from!==s.id);if(filtered.length)pendingSignals.set(target,filtered);else pendingSignals.delete(target);}
 const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}
- try{clearRandomForUser(s.data.user?.id);}catch(e){console.error("disconnect-random-cleanup",e);}
+ // A fila é mantida durante desconexões transitórias; o heartbeat/limpeza automática decide quando expirar.
  const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
 setInterval(async()=>{
