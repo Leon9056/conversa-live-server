@@ -222,6 +222,7 @@ async function initDb(){
  await pool.query("CREATE INDEX IF NOT EXISTS community_channels_community_idx ON community_channels(community_id,id)");
  await pool.query("CREATE INDEX IF NOT EXISTS communities_public_idx ON communities(is_public,created_at DESC)");
  await pool.query("CREATE INDEX IF NOT EXISTS community_members_community_idx ON community_members(community_id,joined_at DESC)");
+ await pool.query("ALTER TABLE communities ALTER COLUMN is_public SET DEFAULT TRUE");
 
 }
 
@@ -420,7 +421,9 @@ app.get("/api/servers",async(q,r)=>{try{
 app.post("/api/servers",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
  if(!rateLimit("server-create:"+u.id,5,10*60*1000))return r.status(429).json({error:"Você criou muitos servidores recentemente. Aguarde alguns minutos."});
- const name=cleanCommunityName(q.body?.name),description=cleanCommunityDesc(q.body?.description),isPublic=q.body?.isPublic!==false;
+ const name=cleanCommunityName(q.body?.name),description=cleanCommunityDesc(q.body?.description);
+ const rawVisibility=q.body?.isPublic;
+ const isPublic=!(rawVisibility===false||String(rawVisibility||"").trim().toLowerCase()==="false"||String(q.body?.visibility||"").trim().toLowerCase()==="private");
  if(name.length<2)return r.status(400).json({error:"O nome do servidor precisa ter pelo menos 2 caracteres."});
  const count=await pool.query("SELECT COUNT(*)::int AS n FROM community_members WHERE user_id=$1 AND role='owner'",[u.id]);
  if(Number(count.rows[0]?.n||0)>=20)return r.status(400).json({error:"Você atingiu o limite de 20 servidores criados."});
@@ -434,7 +437,7 @@ app.post("/api/servers",async(q,r)=>{try{
  }catch(e){if(e?.code!=="23505")throw e;}}
  if(!created)return r.status(500).json({error:"Não foi possível gerar um convite único. Tente novamente."});
  await securityEvent(u.id,"COMMUNITY_CREATED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{communityId:created.id}});
- r.status(201).json({server:{id:Number(created.id),name:created.name,description:created.description,is_public:created.is_public,invite_code:created.invite_code}});
+ r.status(201).json({server:{id:Number(created.id),name:String(created.name||name),description:String(created.description||description),is_public:created.is_public!==false,invite_code:created.invite_code}});
 }catch(e){console.error("server-create",e);r.status(500).json({error:"Não foi possível criar o servidor."})}});
 
 app.post("/api/servers/join",async(q,r)=>{try{
@@ -485,7 +488,9 @@ app.post("/api/servers/:id/channels",async(q,r)=>{try{
 
 app.patch("/api/servers/:id",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),member=await isCommunityMember(u.id,id);if(!member||!['owner','admin'].includes(member.role))return r.status(403).json({error:"Você não tem permissão para editar este servidor."});
- const name=cleanCommunityName(q.body?.name),description=cleanCommunityDesc(q.body?.description),isPublic=q.body?.isPublic!==false;if(name.length<2)return r.status(400).json({error:"Nome inválido."});
+ const name=cleanCommunityName(q.body?.name),description=cleanCommunityDesc(q.body?.description);
+ const rawVisibility=q.body?.isPublic;
+ const isPublic=!(rawVisibility===false||String(rawVisibility||"").trim().toLowerCase()==="false"||String(q.body?.visibility||"").trim().toLowerCase()==="private");if(name.length<2)return r.status(400).json({error:"Nome inválido."});
  await pool.query("UPDATE communities SET name=$1,description=$2,is_public=$3 WHERE id=$4",[name,description,isPublic,id]);r.json({ok:true});
 }catch(e){console.error("server-update",e);r.status(500).json({error:"Não foi possível atualizar o servidor."})}});
 app.patch("/api/servers/:id/members/:memberId",async(q,r)=>{try{
@@ -1281,7 +1286,7 @@ setInterval(async()=>{
 },30*60*1000);
 const PORT=Number(process.env.PORT)||3000;
 server.listen(PORT,"0.0.0.0",()=>{
-  console.log("FreeChat v1.6.2 server ativo na porta "+PORT);
+  console.log("FreeChat v1.6.3 server ativo na porta "+PORT);
   initDbWithRetry();
 });
 async function initDbWithRetry(){
