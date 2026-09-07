@@ -470,11 +470,11 @@ app.post("/api/random/leave",async(q,r)=>{try{const u=await auth(q,r);if(!u)retu
 
 app.post("/api/random/next",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;clearRandomForUser(u.id);const match=await findRandomMatch(u.id);if(match)return r.json({ok:true,match:{matchId:match.matchId,room:match.room,...match.partner}});randomQueue.set(Number(u.id),{code:u.code,name:u.name,avatarUrl:avatarUrlFor(u),joinedAt:Date.now()});r.json({ok:true,waiting:true})}catch(e){r.status(500).json({error:"Não foi possível procurar outra pessoa."})}});
 
-app.get("/",(_,r)=>r.send("FreeChat server OK — v1.4.1 PostgreSQL + música"));
+app.get("/",(_,r)=>r.send("FreeChat server OK — v1.4.2 PostgreSQL + música"));
 app.get("/health",async(_,r)=>{
-  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"1.4.1",service:"conversa-live-server"});
-  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.4.1",service:"conversa-live-server"})}
-  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"1.4.1",service:"conversa-live-server"})}
+  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"1.4.2",service:"conversa-live-server"});
+  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.4.2",service:"conversa-live-server"})}
+  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"1.4.2",service:"conversa-live-server"})}
 });
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
