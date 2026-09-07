@@ -171,6 +171,9 @@ async function initDb(){
  await pool.query(`CREATE TABLE IF NOT EXISTS blocked_users(user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,blocked_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(user_id,blocked_id))`);
  await pool.query(`CREATE TABLE IF NOT EXISTS reports(id BIGSERIAL PRIMARY KEY,reporter_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,target_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,reason VARCHAR(64) NOT NULL,details VARCHAR(1000),status VARCHAR(16) NOT NULL DEFAULT 'open',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
  await pool.query(`CREATE TABLE IF NOT EXISTS user_privacy(user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,message_policy VARCHAR(16) NOT NULL DEFAULT 'friends',call_policy VARCHAR(16) NOT NULL DEFAULT 'friends',friend_policy VARCHAR(16) NOT NULL DEFAULT 'everyone')`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS user_follows(follower_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,following_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(follower_id,following_id))`);
+ await pool.query(`CREATE INDEX IF NOT EXISTS user_follows_follower_idx ON user_follows(follower_id,created_at DESC)`);
+ await pool.query(`CREATE INDEX IF NOT EXISTS user_follows_following_idx ON user_follows(following_id,created_at DESC)`);
  await pool.query(`ALTER TABLE user_privacy ADD COLUMN IF NOT EXISTS random_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
  await pool.query(`CREATE TABLE IF NOT EXISTS random_queue(
    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -388,7 +391,9 @@ function cleanCommunityDesc(v){return String(v??"").replace(/\s+/g," ").trim().s
 function cleanChannelName(v){return String(v??"").replace(/\s+/g," ").trim().slice(0,32)}
 function communityCode(){const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";let out="FR-";for(let i=0;i<8;i++)out+=chars[crypto.randomInt(chars.length)];return out}
 async function isCommunityMember(userId,communityId){
- const x=await pool.query("SELECT role FROM community_members WHERE community_id=$1 AND user_id=$2 LIMIT 1",[userId,communityId]);
+ const uid=Number(userId),cid=Number(communityId);
+ if(!Number.isSafeInteger(uid)||!Number.isSafeInteger(cid)||uid<1||cid<1)return null;
+ const x=await pool.query("SELECT role FROM community_members WHERE community_id=$1 AND user_id=$2 LIMIT 1",[cid,uid]);
  return x.rows[0]||null;
 }
 async function communitySummary(row,userId){
@@ -608,7 +613,7 @@ function feedPublic(row,viewerId){
  return {
   id:row.id,body:row.body||"",created_at:row.created_at,author_id:row.author_id,name:row.name,code:row.code,
   avatarUrl:avatarUrlFor({code:row.code,avatar_mime:row.avatar_mime,avatar_updated_at:row.avatar_updated_at}),
-  likes:Number(row.likes||0),liked:!!row.liked,saves:Number(row.saves||0),saved:!!row.saved,comments:Number(row.comments||0),
+  likes:Number(row.likes||0),liked:!!row.liked,saves:Number(row.saves||0),saved:!!row.saved,comments:Number(row.comments||0),isFollowing:!!row.is_following,isFriend:!!row.is_friend,
   media:row.media_id?{id:row.media_id,type:row.media_type,name:row.media_name,mime:row.media_mime,size:Number(row.media_size||0),duration:Number(row.media_duration||0),url:"/api/feed/media/"+row.media_id+"?mt="+encodeURIComponent(makeMediaToken(row.media_id,viewerId))}:null
  };
 }
@@ -617,38 +622,49 @@ app.get("/api/feed",async(q,r)=>{try{
  const limit=Math.min(Math.max(Number(q.query.limit)||8,1),12);
  const offset=Math.min(Math.max(Number(q.query.offset)||0,0),10000);
  const filter=String(q.query.filter||"for_you");
- const scopeSql=filter==="friends"||filter==="following"
-   ? "(p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1))"
-   : "TRUE";
- // TikTok-style ranking: freshness + engagement + relationship + personal history.
- // We intentionally keep a small deterministic id tie-breaker so scrolling does not reshuffle wildly.
- const x=await pool.query(`WITH stats AS (
+ const friendsOnly=filter==="friends"||filter==="following";
+ // Keep the feed query deliberately simple and index-friendly. The previous
+ // version joined likes/comments/saves together, which multiplied rows
+ // (likes x comments x saves) and could make the endpoint extremely slow or
+ // fail on real datasets. Correlated counts avoid that multiplication.
+ const whereFriends=filter==="following"
+   ? "AND (p.author_id=$1 OR EXISTS(SELECT 1 FROM user_follows uf WHERE uf.follower_id=$1 AND uf.following_id=p.author_id))"
+   : filter==="friends"
+   ? "AND (p.author_id=$1 OR EXISTS(SELECT 1 FROM friendships f WHERE f.user_id=$1 AND f.friend_id=p.author_id))"
+   : "";
+ const x=await pool.query(`WITH ranked AS (
    SELECT p.id,p.body,p.created_at,p.media_type,p.media_name,p.media_mime,p.media_size,p.media_duration,
      CASE WHEN p.media_data IS NOT NULL THEN p.id END AS media_id,
      u.id AS author_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,
-     COUNT(DISTINCT l.user_id)::int AS likes,COUNT(DISTINCT c.id)::int AS comments,COUNT(DISTINCT sv.user_id)::int AS saves,
-     COALESCE(BOOL_OR(l.user_id=$1),false) AS liked,COALESCE(BOOL_OR(sv.user_id=$1),false) AS saved,
-     EXTRACT(EPOCH FROM (NOW()-p.created_at))/3600.0 AS age_hours,
+     (SELECT COUNT(*)::int FROM social_likes l WHERE l.post_id=p.id) AS likes,
+     EXISTS(SELECT 1 FROM social_likes l WHERE l.post_id=p.id AND l.user_id=$1) AS liked,
+     (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id=p.id) AS comments,
+     (SELECT COUNT(*)::int FROM social_saves sv WHERE sv.post_id=p.id) AS saves,
+     EXISTS(SELECT 1 FROM social_saves sv WHERE sv.post_id=p.id AND sv.user_id=$1) AS saved,
+     GREATEST(EXTRACT(EPOCH FROM (NOW()-p.created_at))/3600.0,0) AS age_hours,
      EXISTS(SELECT 1 FROM friendships f WHERE f.user_id=$1 AND f.friend_id=p.author_id) AS is_friend,
-     COALESCE((SELECT SUM(CASE WHEN e.event_type='like' THEN 4 WHEN e.event_type='comment' THEN 5 WHEN e.event_type='save' THEN 6 WHEN e.event_type='view' THEN 0.25 ELSE 0 END) FROM feed_events e WHERE e.user_id=$1 AND e.post_id=p.id AND e.created_at>NOW()-INTERVAL '30 days'),0) AS personal_score,
-     COALESCE((SELECT COUNT(*) FROM feed_events e WHERE e.post_id=p.id AND e.event_type='view' AND e.created_at>NOW()-INTERVAL '7 days'),0) AS views7
+     EXISTS(SELECT 1 FROM user_follows uf WHERE uf.follower_id=$1 AND uf.following_id=p.author_id) AS is_following,
+     COALESCE((SELECT SUM(CASE WHEN e.event_type='like' THEN 4 WHEN e.event_type='comment' THEN 5 WHEN e.event_type='save' THEN 6 WHEN e.event_type='view' THEN 0.25 WHEN e.event_type='share' THEN 3 ELSE 0 END)
+       FROM feed_events e WHERE e.user_id=$1 AND e.post_id=p.id AND e.created_at>NOW()-INTERVAL '30 days'),0) AS personal_score,
+     COALESCE((SELECT COUNT(*)::int FROM feed_events e WHERE e.post_id=p.id AND e.event_type='view' AND e.created_at>NOW()-INTERVAL '7 days'),0) AS views7
    FROM social_posts p JOIN users u ON u.id=p.author_id
-   LEFT JOIN social_likes l ON l.post_id=p.id LEFT JOIN social_comments c ON c.post_id=p.id LEFT JOIN social_saves sv ON sv.post_id=p.id
-   WHERE ${scopeSql}
-   AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.user_id=$1 AND b.blocked_id=p.author_id) OR (b.user_id=p.author_id AND b.blocked_id=$1)) GROUP BY p.id,u.id
- ), ranked AS (
-   SELECT *,
-     (likes*3.0 + comments*5.0 + saves*7.0 + LEAST(views7,500)*0.18
-      + CASE WHEN is_friend THEN 8 ELSE 0 END + personal_score*3
-      + CASE WHEN age_hours < 2 THEN 12 ELSE 0 END
-     ) / POWER(GREATEST(age_hours,0.35)+2,0.72) AS rank_score
-   FROM stats
+   WHERE 1=1 ${whereFriends}
+     AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.user_id=$1 AND b.blocked_id=p.author_id) OR (b.user_id=p.author_id AND b.blocked_id=$1))
  )
- SELECT * FROM ranked ORDER BY rank_score DESC,created_at DESC,id DESC LIMIT $2 OFFSET $3`,[u.id,limit,offset]);
- const total=await pool.query(`SELECT COUNT(*)::int AS n FROM social_posts p WHERE ${scopeSql}`,[u.id]);
- r.json({posts:x.rows.map(p=>feedPublic(p,u.id)),hasMore:x.rows.length===limit,offset:offset+x.rows.length,totalPosts:Number(total.rows[0]?.n||0),algorithm:"freechat-for-you-v1"});
+ SELECT *,
+   (likes*3.0 + comments*5.0 + saves*7.0 + LEAST(views7,500)*0.18
+    + CASE WHEN is_friend THEN 8 ELSE 0 END
+    + CASE WHEN is_following THEN 14 ELSE 0 END + personal_score*3
+    + CASE WHEN age_hours < 2 THEN 12 ELSE 0 END)
+   / POWER(age_hours+2,0.72) AS rank_score
+ FROM ranked
+ ORDER BY rank_score DESC,created_at DESC,id DESC
+ LIMIT $2 OFFSET $3`,[u.id,limit,offset]);
+ const total=await pool.query(`SELECT COUNT(*)::int AS n FROM social_posts p
+   WHERE 1=1 ${whereFriends}
+   AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.user_id=$1 AND b.blocked_id=p.author_id) OR (b.user_id=p.author_id AND b.blocked_id=$1))`,[u.id]);
+ r.json({posts:x.rows.map(p=>feedPublic(p,u.id)),hasMore:x.rows.length===limit,offset:offset+x.rows.length,totalPosts:Number(total.rows[0]?.n||0),algorithm:"freechat-for-you-v2"});
 }catch(e){console.error("feed-ranked",e);r.status(500).json({error:"Erro ao carregar o feed."})}});
-
 app.post("/api/feed/event",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
  const postId=Number(q.body?.postId),type=String(q.body?.eventType||"view").slice(0,24),dwell=Math.min(Math.max(Number(q.body?.dwellMs)||0,0),120000);
@@ -1066,12 +1082,50 @@ app.post("/api/security/privacy",async(q,r)=>{try{await updatePrivacy(q,r)}catch
 app.patch("/api/security/privacy",async(q,r)=>{try{await updatePrivacy(q,r)}catch(e){console.error("privacy-update-patch",e);if(!r.headersSent)r.status(500).json({error:"Não foi possível salvar a privacidade."})}});
 
 app.get("/api/security/blocked",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const x=await pool.query("SELECT u.name,u.code FROM blocked_users b JOIN users u ON u.id=b.blocked_id WHERE b.user_id=$1 ORDER BY b.created_at DESC",[u.id]);r.json({blocked:x.rows})}catch(e){r.status(500).json({error:"Não foi possível carregar bloqueios."})}});
-app.post("/api/security/block",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const target=await getUserByCode(q.body?.code);if(!target||Number(target.id)===Number(u.id))return r.status(400).json({error:"Usuário inválido."});await pool.query("INSERT INTO blocked_users(user_id,blocked_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,target.id]);await securityEvent(u.id,"USER_BLOCKED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{target:target.code}});r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível bloquear."})}});
+app.post("/api/security/block",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const target=await getUserByCode(q.body?.code);if(!target||Number(target.id)===Number(u.id))return r.status(400).json({error:"Usuário inválido."});await pool.query("INSERT INTO blocked_users(user_id,blocked_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,target.id]);
+ await pool.query("DELETE FROM user_follows WHERE (follower_id=$1 AND following_id=$2) OR (follower_id=$2 AND following_id=$1)",[u.id,target.id]);
+ await pool.query("DELETE FROM friend_requests WHERE (sender_id=$1 AND receiver_id=$2) OR (sender_id=$2 AND receiver_id=$1)",[u.id,target.id]);
+ await pool.query("DELETE FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1)",[u.id,target.id]);
+ await securityEvent(u.id,"USER_BLOCKED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{target:target.code}});r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível bloquear."})}});
 app.post("/api/security/unblock",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;await pool.query("DELETE FROM blocked_users WHERE user_id=$1 AND blocked_id=(SELECT id FROM users WHERE code=$2)",[u.id,String(q.body?.code||"").trim().toUpperCase()]);r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível desbloquear."})}});
 app.post("/api/security/report",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const target=await getUserByCode(q.body?.code);const reason=String(q.body?.reason||"").trim().slice(0,64),details=String(q.body?.details||"").trim().slice(0,1000);if(!target||Number(target.id)===Number(u.id)||!reason)return r.status(400).json({error:"Denúncia inválida."});await pool.query("INSERT INTO reports(reporter_id,target_id,reason,details) VALUES($1,$2,$3,$4)",[u.id,target.id,reason,details||null]);await securityEvent(u.id,"REPORT_CREATED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{target:target.code,reason}});r.json({ok:true,message:"Denúncia registrada."})}catch(e){r.status(500).json({error:"Não foi possível registrar a denúncia."})}});
 
+app.get("/api/users/:code/profile",async(q,r)=>{try{
+ const me=await auth(q,r);if(!me)return;
+ const code=String(q.params.code||"").trim().toUpperCase();
+ const target=await getUserByCode(code);if(!target)return r.status(404).json({error:"Usuário não encontrado."});
+ if(await isBlocked(me.id,target.id))return r.status(404).json({error:"Usuário não encontrado."});
+ const [counts,rel]=await Promise.all([
+  pool.query(`SELECT
+    (SELECT COUNT(*)::int FROM user_follows WHERE following_id=$1) AS followers,
+    (SELECT COUNT(*)::int FROM user_follows WHERE follower_id=$1) AS following,
+    (SELECT COUNT(*)::int FROM social_posts WHERE author_id=$1) AS posts`,[target.id]),
+  pool.query(`SELECT EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND following_id=$2) AS following,
+                    EXISTS(SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2) AS friend`,[me.id,target.id])
+ ]);
+ const c=counts.rows[0]||{};const rr=rel.rows[0]||{};
+ r.json({user:pub(target),followers:Number(c.followers||0),following:Number(c.following||0),posts:Number(c.posts||0),isFollowing:!!rr.following,isFriend:!!rr.friend});
+}catch(e){console.error("user-profile",e);r.status(500).json({error:"Não foi possível carregar o perfil."})}});
+app.post("/api/follows/:code",async(q,r)=>{try{
+ const me=await auth(q,r);if(!me)return;
+ if(!rateLimit("follow:"+me.id,60,60*1000))return r.status(429).json({error:"Você fez muitas ações de seguir. Aguarde um momento."});
+ const code=String(q.params.code||"").trim().toUpperCase();const target=await getUserByCode(code);
+ if(!target||Number(target.id)===Number(me.id))return r.status(400).json({error:"Usuário inválido."});
+ if(await isBlocked(me.id,target.id))return r.status(403).json({error:"Não é possível seguir este usuário."});
+ const inserted=await pool.query("INSERT INTO user_follows(follower_id,following_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING follower_id",[me.id,target.id]);
+ if(inserted.rowCount)await addNotification(target.id,"social","Novo seguidor",me.name+" começou a seguir você.",{code:me.code});
+ const c=await pool.query("SELECT COUNT(*)::int AS n FROM user_follows WHERE following_id=$1",[target.id]);
+ r.json({ok:true,following:true,followers:Number(c.rows[0]?.n||0),changed:!!inserted.rowCount});
+}catch(e){console.error("follow",e);r.status(500).json({error:"Não foi possível seguir este usuário."})}});
+app.delete("/api/follows/:code",async(q,r)=>{try{
+ const me=await auth(q,r);if(!me)return;const target=await getUserByCode(String(q.params.code||"").trim().toUpperCase());
+ if(target)await pool.query("DELETE FROM user_follows WHERE follower_id=$1 AND following_id=$2",[me.id,target.id]);
+ const c=target?await pool.query("SELECT COUNT(*)::int AS n FROM user_follows WHERE following_id=$1",[target.id]):{rows:[{n:0}]};
+ r.json({ok:true,following:false,followers:Number(c.rows[0]?.n||0)});
+}catch(e){console.error("unfollow",e);r.status(500).json({error:"Não foi possível deixar de seguir."})}});
+
 app.get("/api/friends",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const f=await pool.query(`SELECT u.name,u.email,u.code,u.avatar_mime,u.avatar_updated_at FROM friendships f JOIN users u ON u.id=f.friend_id WHERE f.user_id=$1 ORDER BY u.name`,[u.id]);const reqs=await pool.query(`SELECT u.name,u.email,u.code,u.avatar_mime,u.avatar_updated_at FROM friend_requests fr JOIN users u ON u.id=fr.sender_id WHERE fr.receiver_id=$1 AND fr.status='pending' ORDER BY fr.created_at DESC`,[u.id]);r.json({friends:f.rows.map(u2=>({...pub(u2),online:onlineByCode.has(u2.code)})),requests:reqs.rows.map(pub)})}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar amigos."})}});
-app.post("/api/friends/request",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Usuário não encontrado."});if(x.id===u.id)return r.status(400).json({error:"Você não pode adicionar a si mesmo."});const privacy=await privacyFor(x.id);if(privacy.friend_policy==="nobody")return r.status(403).json({error:"Este usuário não aceita solicitações de amizade."});if(privacy.friend_policy==="friends"){const fof=await pool.query("SELECT 1 FROM friendships a JOIN friendships b ON a.friend_id=b.friend_id WHERE a.user_id=$1 AND b.user_id=$2 LIMIT 1",[u.id,x.id]);if(!fof.rowCount)return r.status(403).json({error:"Este usuário aceita apenas amigos de amigos."});}const exists=await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[u.id,x.id]);if(exists.rowCount)return r.status(400).json({error:"Vocês já são amigos."});const reverse=await pool.query("SELECT 1 FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(reverse.rowCount)return r.status(400).json({error:"Esse usuário já enviou uma solicitação para você."});await pool.query("INSERT INTO friend_requests(sender_id,receiver_id,status) VALUES($1,$2,'pending') ON CONFLICT(sender_id,receiver_id) DO UPDATE SET status='pending'",[u.id,x.id]);notifyUser(x.code,"friend-request",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Novo convite de amizade",u.name+" quer ser seu amigo.",{code:u.code});r.json({message:"Solicitação enviada."})}catch(e){console.error(e);r.status(500).json({error:"Erro ao enviar solicitação."})}});
+app.post("/api/friends/request",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;if(!rateLimit("friend-request:"+u.id,30,10*60*1000))return r.status(429).json({error:"Você enviou muitos pedidos de amizade. Aguarde alguns minutos."});const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Usuário não encontrado."});if(x.id===u.id)return r.status(400).json({error:"Você não pode adicionar a si mesmo."});const privacy=await privacyFor(x.id);if(privacy.friend_policy==="nobody")return r.status(403).json({error:"Este usuário não aceita solicitações de amizade."});if(privacy.friend_policy==="friends"){const fof=await pool.query("SELECT 1 FROM friendships a JOIN friendships b ON a.friend_id=b.friend_id WHERE a.user_id=$1 AND b.user_id=$2 LIMIT 1",[u.id,x.id]);if(!fof.rowCount)return r.status(403).json({error:"Este usuário aceita apenas amigos de amigos."});}const exists=await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[u.id,x.id]);if(exists.rowCount)return r.status(400).json({error:"Vocês já são amigos."});const reverse=await pool.query("SELECT 1 FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(reverse.rowCount)return r.status(400).json({error:"Esse usuário já enviou uma solicitação para você."});await pool.query("INSERT INTO friend_requests(sender_id,receiver_id,status) VALUES($1,$2,'pending') ON CONFLICT(sender_id,receiver_id) DO UPDATE SET status='pending'",[u.id,x.id]);notifyUser(x.code,"friend-request",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Novo convite de amizade",u.name+" quer ser seu amigo.",{code:u.code});r.json({message:"Solicitação enviada."})}catch(e){console.error(e);r.status(500).json({error:"Erro ao enviar solicitação."})}});
 app.post("/api/friends/accept",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Solicitação não encontrada."});const a=await pool.query("SELECT id FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(!a.rowCount)return r.status(404).json({error:"Solicitação não encontrada."});const client=await pool.connect();try{await client.query("BEGIN");await client.query("UPDATE friend_requests SET status='accepted' WHERE id=$1",[a.rows[0].id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,x.id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[x.id,u.id]);await client.query("COMMIT")}catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}notifyUser(x.code,"friend-accepted",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Convite aceito",u.name+" aceitou seu convite.",{code:u.code});r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao aceitar solicitação."})}});
 app.post("/api/friends/reject",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Solicitação não encontrada."});const a=await pool.query("DELETE FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(!a.rowCount)return r.status(404).json({error:"Solicitação não encontrada."});r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao recusar solicitação."})}});
 app.post("/api/friends/remove",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").toUpperCase(),x=await getUserByCode(c);if(x){await pool.query("DELETE FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1)",[u.id,x.id])}r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao remover amigo."})}});
@@ -1227,7 +1281,7 @@ setInterval(async()=>{
 },30*60*1000);
 const PORT=Number(process.env.PORT)||3000;
 server.listen(PORT,"0.0.0.0",()=>{
-  console.log("FreeChat v1.6.0 server ativo na porta "+PORT);
+  console.log("FreeChat v1.6.2 server ativo na porta "+PORT);
   initDbWithRetry();
 });
 async function initDbWithRetry(){
