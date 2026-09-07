@@ -6,6 +6,7 @@ function allowOrigin(origin){
   if(!origin)return true;
   if(configuredOrigins.length===0||configuredOrigins.includes("*")||configuredOrigins.includes(origin))return true;
   if(origin==="https://freechat-ten.vercel.app")return true;
+   if(origin==="https://freechatsocial.com"||origin==="https://www.freechatsocial.com")return true;
   if(/^https:\/\/[a-z0-9-]+(?:-[a-z0-9-]+)*\.vercel\.app$/i.test(origin))return true;
   if(/^https:\/\/[a-z0-9-]+(?:-[a-z0-9-]+)*\.netlify\.app$/i.test(origin))return true;
   if(/^http:\/\/(localhost|127\.0\.0\.1)(?::\d+)?$/i.test(origin))return true;
@@ -56,8 +57,17 @@ function guard(req,res,next){
 async function initDb(){
  await pool.query(`CREATE TABLE IF NOT EXISTS users(
  id BIGSERIAL PRIMARY KEY,name VARCHAR(24) NOT NULL,email VARCHAR(120) UNIQUE NOT NULL,code VARCHAR(9) UNIQUE NOT NULL,
- salt TEXT NOT NULL,password_hash TEXT NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW()
+ salt TEXT NOT NULL,password_hash TEXT NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW(),email_verified_at TIMESTAMPTZ
  )`);
+ await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ");
+ await pool.query("UPDATE users SET email_verified_at=COALESCE(email_verified_at,created_at) WHERE email_verified_at IS NULL");
+ await pool.query(`CREATE TABLE IF NOT EXISTS email_tokens(
+   id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   token_hash TEXT NOT NULL,type VARCHAR(24) NOT NULL,expires_at TIMESTAMPTZ NOT NULL,
+   used_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ )`);
+ await pool.query("CREATE INDEX IF NOT EXISTS email_tokens_lookup_idx ON email_tokens(token_hash,type,expires_at)");
+ await pool.query("CREATE INDEX IF NOT EXISTS email_tokens_user_idx ON email_tokens(user_id,type,created_at DESC)");
  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_mime VARCHAR(64)`);
  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data BYTEA`);
  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_updated_at TIMESTAMPTZ`);
@@ -182,6 +192,67 @@ function cleanName(value){
 function cleanEmail(value){
   return String(value ?? "").trim().toLowerCase().slice(0,120);
 }
+
+function htmlEscape(value){
+  return String(value??"").replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[ch]));
+}
+const EMAIL_TOKEN_TTL_MS=30*60*1000;
+const VERIFY_TOKEN_TTL_MS=24*60*60*1000;
+function emailConfigured(){
+  return !!(String(process.env.RESEND_API_KEY||"").trim() && String(process.env.RESEND_FROM||"").trim());
+}
+function publicAppUrl(){
+  return String(process.env.APP_URL||"https://freechatsocial.com").trim().replace(/\/+$/,"");
+}
+async function sendResendEmail({to,subject,html,text,idempotencyKey}){
+  const key=String(process.env.RESEND_API_KEY||"").trim();
+  const from=String(process.env.RESEND_FROM||"").trim();
+  if(!key||!from){
+    const e=new Error("O envio de e-mail ainda não está configurado no servidor.");
+    e.code="EMAIL_NOT_CONFIGURED"; throw e;
+  }
+  const payload={from,to:[to],subject,html,text};
+  const headers={"Content-Type":"application/json","Authorization":"Bearer "+key};
+  if(idempotencyKey)headers["Idempotency-Key"]=String(idempotencyKey).slice(0,256);
+  const response=await fetch("https://api.resend.com/emails",{method:"POST",headers,body:JSON.stringify(payload)});
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok){
+    const detail=String(data?.message||data?.error||"Erro do Resend").slice(0,300);
+    const e=new Error(detail);e.code="RESEND_ERROR";e.status=response.status;throw e;
+  }
+  return data;
+}
+function makeEmailToken(){return crypto.randomBytes(32).toString("base64url");}
+function hashEmailToken(token){return crypto.createHash("sha256").update(String(token)).digest("hex");}
+async function createEmailToken(userId,type,ttlMs){
+  const token=makeEmailToken(),hash=hashEmailToken(token),expires=new Date(Date.now()+ttlMs);
+  await pool.query("DELETE FROM email_tokens WHERE user_id=$1 AND type=$2 AND used_at IS NULL",[userId,type]);
+  await pool.query("INSERT INTO email_tokens(user_id,token_hash,type,expires_at) VALUES($1,$2,$3,$4)",[userId,hash,type,expires]);
+  return token;
+}
+async function getEmailToken(token,type){
+  const x=await pool.query("SELECT id,user_id,expires_at,used_at FROM email_tokens WHERE token_hash=$1 AND type=$2 LIMIT 1",[hashEmailToken(token),type]);
+  const row=x.rows[0];
+  if(!row||row.used_at||new Date(row.expires_at).getTime()<Date.now())return null;
+  return row;
+}
+function verificationEmail(u,token){
+  const link=publicAppUrl()+"/?verify="+encodeURIComponent(token),name=htmlEscape(u.name);
+  return {
+    subject:"Verifique seu e-mail — FreeChat",
+    html:`<!doctype html><html><body style="font-family:Arial,sans-serif;background:#0b1020;color:#e8eef8;padding:32px"><div style="max-width:560px;margin:auto;background:#151c2f;border-radius:18px;padding:28px"><h1 style="margin-top:0">Bem-vindo ao FreeChat, ${name}!</h1><p>Confirme seu endereço de e-mail para ativar sua conta.</p><p><a href="${htmlEscape(link)}" style="display:inline-block;padding:12px 18px;background:#6d5dfc;color:#fff;text-decoration:none;border-radius:10px;font-weight:bold">Verificar e-mail</a></p><p style="color:#9aa8bd;font-size:13px">Este link expira em 24 horas.</p><p style="color:#9aa8bd;font-size:12px">Se você não criou esta conta, ignore esta mensagem.</p></div></body></html>`,
+    text:`Bem-vindo ao FreeChat, ${u.name}! Verifique seu e-mail: ${link}\n\nO link expira em 24 horas.`
+  };
+}
+function passwordResetEmail(u,token){
+  const link=publicAppUrl()+"/?reset="+encodeURIComponent(token),name=htmlEscape(u.name);
+  return {
+    subject:"Redefinição de senha — FreeChat",
+    html:`<!doctype html><html><body style="font-family:Arial,sans-serif;background:#0b1020;color:#e8eef8;padding:32px"><div style="max-width:560px;margin:auto;background:#151c2f;border-radius:18px;padding:28px"><h1 style="margin-top:0">Redefinir sua senha</h1><p>Olá, ${name}. Recebemos uma solicitação para redefinir a senha da sua conta.</p><p><a href="${htmlEscape(link)}" style="display:inline-block;padding:12px 18px;background:#6d5dfc;color:#fff;text-decoration:none;border-radius:10px;font-weight:bold">Redefinir senha</a></p><p style="color:#9aa8bd;font-size:13px">Este link expira em 30 minutos e pode ser usado uma única vez.</p><p style="color:#9aa8bd;font-size:12px">Se você não fez esta solicitação, ignore esta mensagem.</p></div></body></html>`,
+    text:`Olá, ${u.name}. Redefina sua senha aqui: ${link}\n\nO link expira em 30 minutos e pode ser usado uma única vez.`
+  };
+}
+
 function code(){
   const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let out="CL-";
@@ -209,14 +280,14 @@ function clearFailedLogin(key){failedLogins.delete(key);}
 async function securityEvent(userId,type,meta={}){try{await pool.query("INSERT INTO security_events(user_id,event_type,ip_hash,user_agent,meta) VALUES($1,$2,$3,$4,$5)",[userId||null,type,meta.ip?crypto.createHash("sha256").update(String(process.env.SESSION_SECRET||"freechat")+String(meta.ip)).digest("hex"):null,String(meta.ua||"").slice(0,300),JSON.stringify(meta.data||{})])}catch(e){console.error("security-event",e)}}
 async function getUserByEmail(email){
   const x=await pool.query(
-    "SELECT id,name,email,code,salt,password_hash,created_at,avatar_mime,avatar_updated_at FROM users WHERE email=$1 LIMIT 1",
+    "SELECT id,name,email,code,salt,password_hash,created_at,email_verified_at,avatar_mime,avatar_updated_at FROM users WHERE email=$1 LIMIT 1",
     [cleanEmail(email)]
   );
   return x.rows[0]||null;
 }
 async function getUserByCode(value){
   const x=await pool.query(
-    "SELECT id,name,email,code,salt,password_hash,created_at,avatar_mime,avatar_updated_at FROM users WHERE code=$1 LIMIT 1",
+    "SELECT id,name,email,code,salt,password_hash,created_at,email_verified_at,avatar_mime,avatar_updated_at FROM users WHERE code=$1 LIMIT 1",
     [String(value??"").trim().toUpperCase()]
   );
   return x.rows[0]||null;
@@ -227,7 +298,7 @@ function avatarUrlFor(u){
   return "/api/avatar/"+u.code+"?v="+v;
 }
 function pub(u){
-  return {id:u.id,name:u.name,email:u.email,code:u.code,avatarUrl:avatarUrlFor(u)};
+  return {id:u.id,name:u.name,email:u.email,code:u.code,emailVerified:!!u.email_verified_at,avatarUrl:avatarUrlFor(u)};
 }
 async function token(u,meta={}){
   const t=crypto.randomBytes(32).toString("base64url");
@@ -399,11 +470,11 @@ app.post("/api/random/leave",async(q,r)=>{try{const u=await auth(q,r);if(!u)retu
 
 app.post("/api/random/next",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;clearRandomForUser(u.id);const match=await findRandomMatch(u.id);if(match)return r.json({ok:true,match:{matchId:match.matchId,room:match.room,...match.partner}});randomQueue.set(Number(u.id),{code:u.code,name:u.name,avatarUrl:avatarUrlFor(u),joinedAt:Date.now()});r.json({ok:true,waiting:true})}catch(e){r.status(500).json({error:"Não foi possível procurar outra pessoa."})}});
 
-app.get("/",(_,r)=>r.send("FreeChat server OK — v1.3.2 PostgreSQL + música"));
+app.get("/",(_,r)=>r.send("FreeChat server OK — v1.4.1 PostgreSQL + música"));
 app.get("/health",async(_,r)=>{
-  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"1.3.2",service:"conversa-live-server"});
-  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.3.2",service:"conversa-live-server"})}
-  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"1.3.2",service:"conversa-live-server"})}
+  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"1.4.1",service:"conversa-live-server"});
+  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.4.1",service:"conversa-live-server"})}
+  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"1.4.1",service:"conversa-live-server"})}
 });
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
@@ -658,6 +729,7 @@ app.get("/api/music/stream/:id",async(q,r)=>{
 
 app.post("/api/register",guard,async(q,r)=>{
   try{
+    if(!emailConfigured())return r.status(503).json({error:"O envio de e-mail do FreeChat ainda não está configurado. Configure RESEND_API_KEY e RESEND_FROM no servidor."});
     const name=cleanName(q.body?.name),email=cleanEmail(q.body?.email),password=String(q.body?.password||"");
     if(name.length<2)return r.status(400).json({error:"O nome precisa ter pelo menos 2 caracteres."});
     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return r.status(400).json({error:"E-mail inválido."});
@@ -665,14 +737,51 @@ app.post("/api/register",guard,async(q,r)=>{
     if(await getUserByEmail(email))return r.status(409).json({error:"Este e-mail já possui uma conta."});
     let c;do c=code();while(await getUserByCode(c));
     const salt=crypto.randomBytes(16).toString("hex"),h=await hashPassword(password);
-    const x=await pool.query("INSERT INTO users(name,email,code,salt,password_hash) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,code",[name,email,c,salt,h]);
+    const x=await pool.query("INSERT INTO users(name,email,code,salt,password_hash,email_verified_at) VALUES($1,$2,$3,$4,$5,NULL) RETURNING id,name,email,code,created_at,email_verified_at",[name,email,c,salt,h]);
     const u=x.rows[0];
+    try{
+      const token=await createEmailToken(u.id,"verify",VERIFY_TOKEN_TTL_MS);
+      const mail=verificationEmail(u,token);
+      await sendResendEmail({...mail,to:email,idempotencyKey:"freechat-verify-"+u.id+"-"+hashEmailToken(token).slice(0,20)});
+    }catch(mailErr){
+      await pool.query("DELETE FROM users WHERE id=$1",[u.id]);
+      throw mailErr;
+    }
     await securityEvent(u.id,"ACCOUNT_CREATED",{ip:requestIp(q),ua:q.headers["user-agent"]});
-    r.json({user:pub(u),token:await token(u,{ip:requestIp(q),ua:q.headers["user-agent"]}),message:"Conta criada com sucesso."});
+    r.json({requiresEmailVerification:true,user:pub(u),message:"Conta criada. Enviamos um link de verificação para seu e-mail."});
   }catch(e){
-    console.error(e);
-    r.status(500).json({error:e.message||"Não foi possível criar a conta."});
+    console.error("register",e);
+    const msg=e?.code==="RESEND_ERROR"?"Não foi possível enviar o e-mail de verificação. Tente novamente em alguns instantes.":e?.message||"Não foi possível criar a conta.";
+    r.status(e?.code==="EMAIL_NOT_CONFIGURED"?503:500).json({error:msg});
   }
+});
+app.get("/api/verify-email",async(q,r)=>{
+  try{
+    const token=String(q.query?.token||"").trim();
+    if(!token||token.length<20)return r.status(400).json({error:"Link de verificação inválido."});
+    const row=await getEmailToken(token,"verify");
+    if(!row)return r.status(400).json({error:"Este link de verificação é inválido, expirou ou já foi usado."});
+    const u=await getUserById(row.user_id);
+    if(!u)return r.status(404).json({error:"Conta não encontrada."});
+    await pool.query("UPDATE users SET email_verified_at=COALESCE(email_verified_at,NOW()) WHERE id=$1",[u.id]);
+    await pool.query("UPDATE email_tokens SET used_at=NOW() WHERE id=$1",[row.id]);
+    await securityEvent(u.id,"EMAIL_VERIFIED",{ip:requestIp(q),ua:q.headers["user-agent"]});
+    r.json({ok:true,message:"E-mail verificado com sucesso. Agora você pode entrar."});
+  }catch(e){console.error("verify-email",e);r.status(500).json({error:"Não foi possível verificar o e-mail."})}
+});
+app.post("/api/resend-verification",guard,async(q,r)=>{
+  const generic={ok:true,message:"Se houver uma conta não verificada para esse e-mail, enviaremos um novo link."};
+  try{
+    if(!emailConfigured())return r.status(200).json(generic);
+    const email=cleanEmail(q.body?.email);
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return r.json(generic);
+    const u=await getUserByEmail(email);
+    if(!u||u.email_verified_at)return r.json(generic);
+    const token=await createEmailToken(u.id,"verify",VERIFY_TOKEN_TTL_MS);
+    const mail=verificationEmail(u,token);
+    await sendResendEmail({...mail,to:u.email,idempotencyKey:"freechat-resend-verify-"+u.id+"-"+Math.floor(Date.now()/600000)});
+    return r.json(generic);
+  }catch(e){console.error("resend-verification",e);return r.json(generic)}
 });
 app.post("/api/login",guard,async(q,r)=>{
   try{
@@ -682,6 +791,9 @@ app.post("/api/login",guard,async(q,r)=>{
     if(!u){noteFailedLogin(key);await securityEvent(null,"LOGIN_FAILED",{ip,ua:q.headers["user-agent"],data:{email}});return r.status(401).json({error:"E-mail ou senha incorretos."});}
     const ok=await verifyPassword(p,u.password_hash,u.salt);
     if(!ok){noteFailedLogin(key);await securityEvent(u.id,"LOGIN_FAILED",{ip,ua:q.headers["user-agent"]});return r.status(401).json({error:"E-mail ou senha incorretos."});}
+    if(!u.email_verified_at){
+      return r.status(403).json({error:"Confirme seu e-mail antes de entrar. Verifique sua caixa de entrada ou solicite um novo link.",verificationRequired:true});
+    }
     clearFailedLogin(key);
     if(!String(u.password_hash).startsWith("scrypt$")){const upgraded=await hashPassword(p);await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2",[upgraded,u.id]);}
     const t=await token(u,{ip,ua:q.headers["user-agent"]});
@@ -690,6 +802,37 @@ app.post("/api/login",guard,async(q,r)=>{
   }catch(e){console.error(e);r.status(500).json({error:"Erro ao entrar."});}
 });
 
+app.post("/api/forgot-password",guard,async(q,r)=>{
+  const generic={ok:true,message:"Se houver uma conta com esse e-mail, enviaremos instruções para redefinir a senha."};
+  try{
+    if(!emailConfigured())return r.json(generic);
+    const email=cleanEmail(q.body?.email);
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return r.json(generic);
+    const u=await getUserByEmail(email);
+    if(!u)return r.json(generic);
+    const token=await createEmailToken(u.id,"reset",EMAIL_TOKEN_TTL_MS);
+    const mail=passwordResetEmail(u,token);
+    await sendResendEmail({...mail,to:u.email,idempotencyKey:"freechat-reset-"+u.id+"-"+Math.floor(Date.now()/600000)});
+    return r.json(generic);
+  }catch(e){console.error("forgot-password",e);return r.json(generic)}
+});
+app.post("/api/reset-password",guard,async(q,r)=>{
+  try{
+    const token=String(q.body?.token||"").trim(),next=String(q.body?.password||"");
+    if(!token)return r.status(400).json({error:"Token de redefinição inválido."});
+    if(next.length<10||!/[A-Za-z]/.test(next)||!/[0-9]/.test(next))return r.status(400).json({error:"A nova senha precisa ter pelo menos 10 caracteres e incluir letras e números."});
+    const row=await getEmailToken(token,"reset");
+    if(!row)return r.status(400).json({error:"Este link de redefinição é inválido, expirou ou já foi usado."});
+    const u=await getUserById(row.user_id);
+    if(!u)return r.status(404).json({error:"Conta não encontrada."});
+    const h=await hashPassword(next);
+    await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2",[h,u.id]);
+    await pool.query("UPDATE email_tokens SET used_at=NOW() WHERE id=$1",[row.id]);
+    await pool.query("DELETE FROM app_sessions WHERE user_id=$1",[u.id]);
+    await securityEvent(u.id,"PASSWORD_RESET",{ip:requestIp(q),ua:q.headers["user-agent"]});
+    r.json({ok:true,message:"Senha redefinida com sucesso. Agora você pode entrar."});
+  }catch(e){console.error("reset-password",e);r.status(500).json({error:"Não foi possível redefinir a senha."})}
+});
 app.post("/api/logout",async(q,r)=>{try{const raw=String(q.headers.authorization||"");const t=raw.startsWith("Bearer ")?raw.slice(7).trim():"";if(t){const sess=await getSession(t);if(sess)await securityEvent(sess.userId,"LOGOUT",{ip:requestIp(q),ua:q.headers["user-agent"]});sessions.delete(t);await pool.query("DELETE FROM app_sessions WHERE token=$1",[sessionHash(t)]);}r.json({ok:true})}catch(e){r.json({ok:true})}});
 
 app.get("/api/security/sessions",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const raw=String(q.headers.authorization||"");const current=raw.startsWith("Bearer ")?sessionHash(raw.slice(7).trim()):"";const x=await pool.query("SELECT token,created_at,last_seen_at,user_agent,expires_at FROM app_sessions WHERE user_id=$1 AND expires_at>NOW() ORDER BY last_seen_at DESC",[u.id]);r.json({sessions:x.rows.map(v=>({id:crypto.createHash("sha256").update(v.token).digest("hex").slice(0,12),current:v.token===current,created_at:v.created_at,last_seen_at:v.last_seen_at,expires_at:v.expires_at,user_agent:v.user_agent||"Navegador"}))})}catch(e){r.status(500).json({error:"Não foi possível carregar as sessões."})}});
@@ -956,11 +1099,11 @@ setInterval(async()=>{
  for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);
  for(const [id,v] of randomQueue)if(now-v.joinedAt>10*60*1000)randomQueue.delete(id);
  for(const [mid,m] of randomMatches)if(now-m.createdAt>30*60*1000)randomMatches.delete(mid);
- try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}
+ try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()");await pool.query("DELETE FROM email_tokens WHERE expires_at<NOW() OR (used_at IS NOT NULL AND created_at<NOW()-INTERVAL '7 days')")}catch(e){}
 },30*60*1000);
 const PORT=Number(process.env.PORT)||3000;
 server.listen(PORT,"0.0.0.0",()=>{
-  console.log("FreeChat v1.3.2 server ativo na porta "+PORT);
+  console.log("FreeChat v1.4.0 FA2 server ativo na porta "+PORT);
   initDbWithRetry();
 });
 async function initDbWithRetry(){
