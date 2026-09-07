@@ -119,6 +119,14 @@ async function initDb(){
    PRIMARY KEY(post_id,user_id)
  )`);
  await pool.query("CREATE INDEX IF NOT EXISTS social_posts_created_idx ON social_posts(created_at DESC,id DESC)");
+ await pool.query(`CREATE TABLE IF NOT EXISTS feed_events(
+   id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+   event_type VARCHAR(24) NOT NULL, dwell_ms INTEGER NOT NULL DEFAULT 0,
+   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ )`);
+ await pool.query("CREATE INDEX IF NOT EXISTS feed_events_user_idx ON feed_events(user_id,created_at DESC)");
+ await pool.query("CREATE INDEX IF NOT EXISTS feed_events_post_idx ON feed_events(post_id,event_type,created_at DESC)");
  await pool.query(`CREATE TABLE IF NOT EXISTS notifications(
    id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    type VARCHAR(32) NOT NULL, title VARCHAR(120) NOT NULL, body VARCHAR(500), data JSONB, read_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -209,6 +217,8 @@ async function initDb(){
  )`);
  await pool.query("CREATE INDEX IF NOT EXISTS community_members_user_idx ON community_members(user_id)");
  await pool.query("CREATE INDEX IF NOT EXISTS community_channels_community_idx ON community_channels(community_id,id)");
+ await pool.query("CREATE INDEX IF NOT EXISTS communities_public_idx ON communities(is_public,created_at DESC)");
+ await pool.query("CREATE INDEX IF NOT EXISTS community_members_community_idx ON community_members(community_id,joined_at DESC)");
 
 }
 
@@ -454,8 +464,10 @@ app.get("/api/servers/:id",async(q,r)=>{try{
  const s=await pool.query("SELECT id,owner_id,name,description,is_public,invite_code,created_at FROM communities WHERE id=$1 LIMIT 1",[id]);if(!s.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
  const ch=await pool.query("SELECT id,name,type FROM community_channels WHERE community_id=$1 ORDER BY CASE WHEN type='text' THEN 0 ELSE 1 END,id",[id]);
  const mc=await pool.query("SELECT COUNT(*)::int AS n FROM community_members WHERE community_id=$1",[id]);
+ const members=await pool.query(`SELECT u.id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,cm.role,cm.joined_at
+   FROM community_members cm JOIN users u ON u.id=cm.user_id WHERE cm.community_id=$1 ORDER BY CASE cm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,cm.joined_at ASC LIMIT 100`,[id]);
  const channels=ch.rows.map(c=>({id:Number(c.id),name:c.name,type:c.type,room_name:`srv-${id}-${c.id}`}));
- r.json({server:{id:Number(s.rows[0].id),owner_id:Number(s.rows[0].owner_id),name:s.rows[0].name,description:s.rows[0].description||"",is_public:!!s.rows[0].is_public,invite_code:Number(s.rows[0].owner_id)===Number(u.id)?s.rows[0].invite_code:null,role:member.role,member_count:Number(mc.rows[0]?.n||0),created_at:s.rows[0].created_at,channels}});
+ r.json({server:{id:Number(s.rows[0].id),owner_id:Number(s.rows[0].owner_id),name:s.rows[0].name,description:s.rows[0].description||"",is_public:!!s.rows[0].is_public,invite_code:Number(s.rows[0].owner_id)===Number(u.id)?s.rows[0].invite_code:null,role:member.role,member_count:Number(mc.rows[0]?.n||0),created_at:s.rows[0].created_at,channels,members:members.rows.map(m=>({id:Number(m.id),name:m.name,code:m.code,role:m.role,avatarUrl:avatarUrlFor(m)}))}});
 }catch(e){console.error("server-detail",e);r.status(500).json({error:"Não foi possível carregar o servidor."})}});
 
 app.post("/api/servers/:id/channels",async(q,r)=>{try{
@@ -465,6 +477,23 @@ app.post("/api/servers/:id/channels",async(q,r)=>{try{
  const dup=await pool.query("SELECT 1 FROM community_channels WHERE community_id=$1 AND lower(name)=lower($2) LIMIT 1",[id,name]);if(dup.rowCount)return r.status(409).json({error:"Já existe um canal com esse nome."});
  const x=await pool.query("INSERT INTO community_channels(community_id,name,type) VALUES($1,$2,$3) RETURNING id,name,type",[id,name,type]);r.status(201).json({channel:{id:Number(x.rows[0].id),name:x.rows[0].name,type:x.rows[0].type,room_name:`srv-${id}-${x.rows[0].id}`} });
 }catch(e){console.error("channel-create",e);r.status(500).json({error:"Não foi possível criar o canal."})}});
+
+app.patch("/api/servers/:id",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),member=await isCommunityMember(u.id,id);if(!member||!['owner','admin'].includes(member.role))return r.status(403).json({error:"Você não tem permissão para editar este servidor."});
+ const name=cleanCommunityName(q.body?.name),description=cleanCommunityDesc(q.body?.description),isPublic=q.body?.isPublic!==false;if(name.length<2)return r.status(400).json({error:"Nome inválido."});
+ await pool.query("UPDATE communities SET name=$1,description=$2,is_public=$3 WHERE id=$4",[name,description,isPublic,id]);r.json({ok:true});
+}catch(e){console.error("server-update",e);r.status(500).json({error:"Não foi possível atualizar o servidor."})}});
+app.patch("/api/servers/:id/members/:memberId",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),memberId=Number(q.params.memberId),me=await isCommunityMember(u.id,id);if(!me||me.role!=="owner")return r.status(403).json({error:"Somente o proprietário pode gerenciar administradores."});
+ if(!Number.isSafeInteger(memberId)||memberId<1)return r.status(400).json({error:"Membro inválido."});const role=String(q.body?.role||"member");if(!['admin','member'].includes(role))return r.status(400).json({error:"Cargo inválido."});
+ const x=await pool.query("UPDATE community_members SET role=$1 WHERE community_id=$2 AND user_id=$3 AND role<>'owner' RETURNING user_id,role",[role,id,memberId]);if(!x.rowCount)return r.status(404).json({error:"Membro não encontrado ou proprietário."});r.json({ok:true,member:{id:memberId,role}});
+}catch(e){console.error("server-member-role",e);r.status(500).json({error:"Não foi possível atualizar o cargo."})}});
+app.delete("/api/servers/:id/channels/:channelId",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),channelId=Number(q.params.channelId),member=await isCommunityMember(u.id,id);if(!member||!['owner','admin'].includes(member.role))return r.status(403).json({error:"Você não tem permissão para remover canais."});
+ const x=await pool.query("SELECT type FROM community_channels WHERE id=$1 AND community_id=$2",[channelId,id]);if(!x.rowCount)return r.status(404).json({error:"Canal não encontrado."});
+ if(x.rows[0].type==='text'){const c=await pool.query("SELECT COUNT(*)::int AS n FROM community_channels WHERE community_id=$1 AND type='text'",[id]);if(Number(c.rows[0].n)<=1)return r.status(400).json({error:"O servidor precisa manter pelo menos um canal de texto."});}
+ await pool.query("DELETE FROM community_channels WHERE id=$1 AND community_id=$2",[channelId,id]);r.json({ok:true});
+}catch(e){console.error("channel-delete",e);r.status(500).json({error:"Não foi possível remover o canal."})}});
 
 /* Random matchmaking: fila persistente e resultado persistente no PostgreSQL. */
 function randomRoomId(){return "random-"+crypto.randomBytes(8).toString("hex")}
@@ -585,28 +614,49 @@ function feedPublic(row,viewerId){
 }
 app.get("/api/feed",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
- const limit=Math.min(Math.max(Number(q.query.limit)||12,1),24);
+ const limit=Math.min(Math.max(Number(q.query.limit)||8,1),12);
  const offset=Math.min(Math.max(Number(q.query.offset)||0,0),10000);
- const filter=String(q.query.filter||"recent");
- // O feed principal é público para qualquer usuário autenticado.
- // O filtro "friends" continua disponível como uma visão opcional somente de amigos.
- const scopeSql=filter==="friends"
-   ? "p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1)"
+ const filter=String(q.query.filter||"for_you");
+ const scopeSql=filter==="friends"||filter==="following"
+   ? "(p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1))"
    : "TRUE";
- const x=await pool.query(`SELECT p.id,p.body,p.created_at,p.media_type,p.media_name,p.media_mime,p.media_size,p.media_duration,
-   CASE WHEN p.media_data IS NOT NULL THEN p.id END AS media_id,
-   u.id AS author_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,
-   COUNT(DISTINCT l.post_id)::int AS likes,COALESCE(BOOL_OR(l.user_id=$1),false) AS liked,
-   COUNT(DISTINCT c.id)::int AS comments,COUNT(DISTINCT sv.user_id)::int AS saves,COALESCE(BOOL_OR(sv.user_id=$1),false) AS saved
+ // TikTok-style ranking: freshness + engagement + relationship + personal history.
+ // We intentionally keep a small deterministic id tie-breaker so scrolling does not reshuffle wildly.
+ const x=await pool.query(`WITH stats AS (
+   SELECT p.id,p.body,p.created_at,p.media_type,p.media_name,p.media_mime,p.media_size,p.media_duration,
+     CASE WHEN p.media_data IS NOT NULL THEN p.id END AS media_id,
+     u.id AS author_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,
+     COUNT(DISTINCT l.user_id)::int AS likes,COUNT(DISTINCT c.id)::int AS comments,COUNT(DISTINCT sv.user_id)::int AS saves,
+     COALESCE(BOOL_OR(l.user_id=$1),false) AS liked,COALESCE(BOOL_OR(sv.user_id=$1),false) AS saved,
+     EXTRACT(EPOCH FROM (NOW()-p.created_at))/3600.0 AS age_hours,
+     EXISTS(SELECT 1 FROM friendships f WHERE f.user_id=$1 AND f.friend_id=p.author_id) AS is_friend,
+     COALESCE((SELECT SUM(CASE WHEN e.event_type='like' THEN 4 WHEN e.event_type='comment' THEN 5 WHEN e.event_type='save' THEN 6 WHEN e.event_type='view' THEN 0.25 ELSE 0 END) FROM feed_events e WHERE e.user_id=$1 AND e.post_id=p.id AND e.created_at>NOW()-INTERVAL '30 days'),0) AS personal_score,
+     COALESCE((SELECT COUNT(*) FROM feed_events e WHERE e.post_id=p.id AND e.event_type='view' AND e.created_at>NOW()-INTERVAL '7 days'),0) AS views7
    FROM social_posts p JOIN users u ON u.id=p.author_id
-   LEFT JOIN social_likes l ON l.post_id=p.id
-   LEFT JOIN social_comments c ON c.post_id=p.id
-   LEFT JOIN social_saves sv ON sv.post_id=p.id
+   LEFT JOIN social_likes l ON l.post_id=p.id LEFT JOIN social_comments c ON c.post_id=p.id LEFT JOIN social_saves sv ON sv.post_id=p.id
    WHERE ${scopeSql}
-   GROUP BY p.id,u.id ORDER BY p.created_at DESC,p.id DESC LIMIT $2 OFFSET $3`,[u.id,limit,offset]);
- r.json({posts:x.rows.map(p=>feedPublic(p,u.id)),hasMore:x.rows.length===limit,offset:offset+x.rows.length});
-}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar o feed."})}});
+   AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.user_id=$1 AND b.blocked_id=p.author_id) OR (b.user_id=p.author_id AND b.blocked_id=$1)) GROUP BY p.id,u.id
+ ), ranked AS (
+   SELECT *,
+     (likes*3.0 + comments*5.0 + saves*7.0 + LEAST(views7,500)*0.18
+      + CASE WHEN is_friend THEN 8 ELSE 0 END + personal_score*3
+      + CASE WHEN age_hours < 2 THEN 12 ELSE 0 END
+     ) / POWER(GREATEST(age_hours,0.35)+2,0.72) AS rank_score
+   FROM stats
+ )
+ SELECT * FROM ranked ORDER BY rank_score DESC,created_at DESC,id DESC LIMIT $2 OFFSET $3`,[u.id,limit,offset]);
+ const total=await pool.query(`SELECT COUNT(*)::int AS n FROM social_posts p WHERE ${scopeSql}`,[u.id]);
+ r.json({posts:x.rows.map(p=>feedPublic(p,u.id)),hasMore:x.rows.length===limit,offset:offset+x.rows.length,totalPosts:Number(total.rows[0]?.n||0),algorithm:"freechat-for-you-v1"});
+}catch(e){console.error("feed-ranked",e);r.status(500).json({error:"Erro ao carregar o feed."})}});
 
+app.post("/api/feed/event",async(q,r)=>{try{
+ const u=await auth(q,r);if(!u)return;
+ const postId=Number(q.body?.postId),type=String(q.body?.eventType||"view").slice(0,24),dwell=Math.min(Math.max(Number(q.body?.dwellMs)||0,0),120000);
+ if(!Number.isSafeInteger(postId)||postId<1||!['view','dwell','like','comment','save','share','skip'].includes(type))return r.status(400).json({error:"Evento inválido."});
+ if(!rateLimit("feed-event:"+u.id,180,60*1000))return r.status(429).json({error:"Muitas interações. Aguarde."});
+ await pool.query("INSERT INTO feed_events(user_id,post_id,event_type,dwell_ms) SELECT $1,$2,$3,$4 WHERE EXISTS(SELECT 1 FROM social_posts WHERE id=$2)",[u.id,postId,type,dwell]);
+ r.json({ok:true});
+}catch(e){console.error("feed-event",e);r.status(500).json({error:"Não foi possível registrar a interação."})}});
 async function canViewFeedPost(viewerId,postId){
  // Publicações do feed são públicas dentro do FreeChat para usuários autenticados.
  // A autenticação continua obrigatória para evitar acesso anônimo às ações da rede social.
@@ -712,8 +762,14 @@ app.get("/api/feed/media/:id",async(q,r)=>{try{
  if(!tokenViewerId || !verifyMediaToken(mt,id,tokenViewerId))return r.status(403).end();
  const me=await getUserById(tokenViewerId);
  if(!me)return r.status(401).end();
- const allowed=Number(row.author_id)===Number(me.id) || (await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[me.id,row.author_id])).rowCount;
- if(!allowed)return r.status(403).end();
+ const blocked=await pool.query("SELECT 1 FROM blocked_users WHERE (user_id=$1 AND blocked_id=$2) OR (user_id=$2 AND blocked_id=$1) LIMIT 1",[me.id,row.author_id]);
+ if(blocked.rowCount)return r.status(403).end();
+ // Feed media is available to any authenticated viewer. The signed token
+ // proves which authenticated viewer requested the media, while the block
+ // check preserves privacy controls. Posts themselves are public inside the
+ // authenticated FreeChat feed, so requiring friendship here would make
+ // public image/video posts silently fail for non-friends.
+
  const buf=row.media_data,total=buf.length,mime=row.media_mime||"application/octet-stream";
  r.setHeader("Content-Type",mime);r.setHeader("Content-Disposition",`inline; filename*=UTF-8''${encodeURIComponent(row.media_name||"media")}`);
  r.setHeader("Accept-Ranges","bytes");r.setHeader("Cache-Control","private, max-age=3600");
@@ -1171,7 +1227,7 @@ setInterval(async()=>{
 },30*60*1000);
 const PORT=Number(process.env.PORT)||3000;
 server.listen(PORT,"0.0.0.0",()=>{
-  console.log("FreeChat v1.5.0 server ativo na porta "+PORT);
+  console.log("FreeChat v1.6.0 server ativo na porta "+PORT);
   initDbWithRetry();
 });
 async function initDbWithRetry(){
