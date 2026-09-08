@@ -1286,7 +1286,7 @@ setInterval(async()=>{
 },30*60*1000);
 const PORT=Number(process.env.PORT)||3000;
 server.listen(PORT,"0.0.0.0",()=>{
-  console.log("FreeChat v1.6.5 server ativo na porta "+PORT);
+  console.log("FreeChat v1.6.6 server ativo na porta "+PORT);
   initDbWithRetry();
 });
 async function initDbWithRetry(){
