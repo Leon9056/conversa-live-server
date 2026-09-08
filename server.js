@@ -660,6 +660,12 @@ app.get("/api/feed",async(q,r)=>{try{
      COALESCE((SELECT COUNT(*)::int FROM feed_events e WHERE e.post_id=p.id AND e.event_type='view' AND e.created_at>NOW()-INTERVAL '7 days'),0) AS views7
    FROM social_posts p JOIN users u ON u.id=p.author_id
    WHERE 1=1 ${whereFriends}
+     -- Limita o universo de posts que entram na pontuação a uma janela recente.
+     -- Sem isso, as subconsultas de engajamento rodam para TODO post já criado
+     -- antes mesmo de aplicar o LIMIT — a consulta ficava cada vez mais lenta
+     -- conforme a base de posts/eventos crescia. 21 dias é suficiente pra um
+     -- "para você" relevante sem escanear o histórico inteiro.
+     AND p.created_at > NOW() - INTERVAL '21 days'
      AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.user_id=$1 AND b.blocked_id=p.author_id) OR (b.user_id=p.author_id AND b.blocked_id=$1))
  )
  SELECT *,
@@ -673,6 +679,7 @@ app.get("/api/feed",async(q,r)=>{try{
  LIMIT $2 OFFSET $3`,[u.id,limit,offset]);
  const total=await pool.query(`SELECT COUNT(*)::int AS n FROM social_posts p
    WHERE 1=1 ${whereFriends}
+   AND p.created_at > NOW() - INTERVAL '21 days'
    AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.user_id=$1 AND b.blocked_id=p.author_id) OR (b.user_id=p.author_id AND b.blocked_id=$1))`,[u.id]);
  r.json({posts:x.rows.map(p=>feedPublic(p,u.id)),hasMore:x.rows.length===limit,offset:offset+x.rows.length,totalPosts:Number(total.rows[0]?.n||0),algorithm:"freechat-for-you-v2"});
 }catch(e){console.error("feed-ranked",e);r.status(500).json({error:"Erro ao carregar o feed."})}});
