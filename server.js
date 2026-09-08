@@ -66,7 +66,8 @@ async function initDb(){
  salt TEXT NOT NULL,password_hash TEXT NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW(),email_verified_at TIMESTAMPTZ
  )`);
  await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ");
- await pool.query("UPDATE users SET email_verified_at=COALESCE(email_verified_at,created_at) WHERE email_verified_at IS NULL");
+ await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ");
+ await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason VARCHAR(300)"); await pool.query("UPDATE users SET email_verified_at=COALESCE(email_verified_at,created_at) WHERE email_verified_at IS NULL");
  await pool.query(`CREATE TABLE IF NOT EXISTS email_tokens(
    id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    token_hash TEXT NOT NULL,type VARCHAR(24) NOT NULL,expires_at TIMESTAMPTZ NOT NULL,
@@ -210,6 +211,7 @@ async function initDb(){
    invite_code VARCHAR(16) UNIQUE NOT NULL,
    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
  )`);
+ await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS icon VARCHAR(8) NOT NULL DEFAULT '🌐'");
  await pool.query(`CREATE TABLE IF NOT EXISTS community_members(
    community_id BIGINT NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -387,6 +389,12 @@ async function auth(req,res){
     res.status(401).json({error:"Sessão inválida."});
     return null;
   }
+  if(u.banned_at){
+    sessions.delete(t);
+    await pool.query("DELETE FROM app_sessions WHERE token=$1",[sessionHash(t)]);
+    res.status(403).json({error:"Sua conta foi suspensa."+(u.ban_reason?" Motivo: "+u.ban_reason:"")});
+    return null;
+  }
   sess.expires=Date.now()+SESSION_TTL_MS;
   await pool.query("UPDATE app_sessions SET expires_at=to_timestamp($2/1000.0),email=$3,last_seen_at=NOW() WHERE token=$1",[sessionHash(t),sess.expires,u.email]);
   return u;
@@ -394,6 +402,16 @@ async function auth(req,res){
 
 
 function cleanCommunityName(v){return String(v??"").replace(/\s+/g," ").trim().slice(0,48)}
+
+/* ===== Painel de administração — acesso restrito por e-mail ===== */
+const ADMIN_EMAILS=["fre3chat@gmail.com"];
+function isAdminUser(u){return !!u&&ADMIN_EMAILS.includes(String(u.email||"").toLowerCase());}
+async function requireAdmin(req,res){
+  const u=await auth(req,res);
+  if(!u)return null; // auth() já respondeu 401
+  if(!isAdminUser(u)){res.status(403).json({error:"Acesso restrito ao administrador."});return null;}
+  return u;
+}
 function cleanCommunityDesc(v){return String(v??"").replace(/\s+/g," ").trim().slice(0,180)}
 function cleanChannelName(v){return String(v??"").replace(/\s+/g," ").trim().slice(0,32)}
 function communityCode(){const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";let out="FR-";for(let i=0;i<8;i++)out+=chars[crypto.randomInt(chars.length)];return out}
@@ -510,6 +528,119 @@ app.delete("/api/servers/:id/channels/:channelId",async(q,r)=>{try{
  if(x.rows[0].type==='text'){const c=await pool.query("SELECT COUNT(*)::int AS n FROM community_channels WHERE community_id=$1 AND type='text'",[id]);if(Number(c.rows[0].n)<=1)return r.status(400).json({error:"O servidor precisa manter pelo menos um canal de texto."});}
  await pool.query("DELETE FROM community_channels WHERE id=$1 AND community_id=$2",[channelId,id]);r.json({ok:true});
 }catch(e){console.error("channel-delete",e);r.status(500).json({error:"Não foi possível remover o canal."})}});
+
+/* ===== Painel de administração (acesso restrito) ===== */
+app.get("/api/admin/check",async(q,r)=>{try{
+  const u=await auth(q,r);if(!u)return;
+  r.json({isAdmin:isAdminUser(u)});
+}catch(e){console.error("admin-check",e);r.status(500).json({error:"Erro."})}});
+
+app.get("/api/admin/stats",async(q,r)=>{try{
+  const admin=await requireAdmin(q,r);if(!admin)return;
+  const [users,verified,bannedN,posts,postsToday,servers,openReports,messages7d,newUsers7d]=await Promise.all([
+    pool.query("SELECT COUNT(*)::int AS n FROM users"),
+    pool.query("SELECT COUNT(*)::int AS n FROM users WHERE email_verified_at IS NOT NULL"),
+    pool.query("SELECT COUNT(*)::int AS n FROM users WHERE banned_at IS NOT NULL"),
+    pool.query("SELECT COUNT(*)::int AS n FROM social_posts"),
+    pool.query("SELECT COUNT(*)::int AS n FROM social_posts WHERE created_at>NOW()-INTERVAL '24 hours'"),
+    pool.query("SELECT COUNT(*)::int AS n FROM communities"),
+    pool.query("SELECT COUNT(*)::int AS n FROM reports WHERE status='open'"),
+    pool.query("SELECT COUNT(*)::int AS n FROM direct_messages WHERE created_at>NOW()-INTERVAL '7 days'"),
+    pool.query("SELECT COUNT(*)::int AS n FROM users WHERE created_at>NOW()-INTERVAL '7 days'"),
+  ]);
+  r.json({
+    totalUsers:users.rows[0].n,verifiedUsers:verified.rows[0].n,bannedUsers:bannedN.rows[0].n,
+    totalPosts:posts.rows[0].n,postsToday:postsToday.rows[0].n,
+    totalServers:servers.rows[0].n,openReports:openReports.rows[0].n,
+    messages7d:messages7d.rows[0].n,newUsers7d:newUsers7d.rows[0].n,
+    activeRooms:rooms.size,activeCalls:calls.size,
+  });
+}catch(e){console.error("admin-stats",e);r.status(500).json({error:"Não foi possível carregar as estatísticas."})}});
+
+app.get("/api/admin/users",async(q,r)=>{try{
+  const admin=await requireAdmin(q,r);if(!admin)return;
+  const search=String(q.query?.q||"").trim().slice(0,60);
+  const limit=Math.min(Math.max(Number(q.query.limit)||30,1),100);
+  const offset=Math.min(Math.max(Number(q.query.offset)||0,0),10000);
+  const like=`%${search}%`;
+  const x=await pool.query(`SELECT id,name,email,code,created_at,email_verified_at,banned_at,ban_reason,
+      (SELECT COUNT(*)::int FROM social_posts WHERE author_id=users.id) AS post_count
+    FROM users
+    WHERE ($1='' OR name ILIKE $2 OR email ILIKE $2 OR code ILIKE $2)
+    ORDER BY created_at DESC LIMIT $3 OFFSET $4`,[search,like,limit,offset]);
+  r.json({users:x.rows.map(u=>({id:Number(u.id),name:u.name,email:u.email,code:u.code,createdAt:u.created_at,verified:!!u.email_verified_at,banned:!!u.banned_at,banReason:u.ban_reason,postCount:u.post_count,online:onlineByCode.has(u.code)})),hasMore:x.rows.length===limit,offset:offset+x.rows.length});
+}catch(e){console.error("admin-users",e);r.status(500).json({error:"Não foi possível carregar os usuários."})}});
+
+app.post("/api/admin/users/:id/ban",async(q,r)=>{try{
+  const admin=await requireAdmin(q,r);if(!admin)return;
+  const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Usuário inválido."});
+  const target=await pool.query("SELECT id,email FROM users WHERE id=$1 LIMIT 1",[id]);if(!target.rowCount)return r.status(404).json({error:"Usuário não encontrado."});
+  if(isAdminUser(target.rows[0]))return r.status(400).json({error:"Não é possível banir o administrador."});
+  const reason=String(q.body?.reason||"").trim().slice(0,300)||null;
+  await pool.query("UPDATE users SET banned_at=NOW(),ban_reason=$2 WHERE id=$1",[id,reason]);
+  await securityEvent(id,"ADMIN_BANNED",{data:{by:admin.email,reason}});
+  r.json({ok:true});
+}catch(e){console.error("admin-ban",e);r.status(500).json({error:"Não foi possível suspender o usuário."})}});
+
+app.post("/api/admin/users/:id/unban",async(q,r)=>{try{
+  const admin=await requireAdmin(q,r);if(!admin)return;
+  const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Usuário inválido."});
+  await pool.query("UPDATE users SET banned_at=NULL,ban_reason=NULL WHERE id=$1",[id]);
+  await securityEvent(id,"ADMIN_UNBANNED",{data:{by:admin.email}});
+  r.json({ok:true});
+}catch(e){console.error("admin-unban",e);r.status(500).json({error:"Não foi possível reativar o usuário."})}});
+
+app.get("/api/admin/reports",async(q,r)=>{try{
+  const admin=await requireAdmin(q,r);if(!admin)return;
+  const status=String(q.query?.status||"open");
+  const x=await pool.query(`SELECT rp.id,rp.reason,rp.details,rp.status,rp.created_at,
+      reporter.name AS reporter_name,reporter.code AS reporter_code,
+      target.id AS target_id,target.name AS target_name,target.code AS target_code,target.banned_at
+    FROM reports rp
+    JOIN users reporter ON reporter.id=rp.reporter_id
+    JOIN users target ON target.id=rp.target_id
+    WHERE ($1='all' OR rp.status=$1)
+    ORDER BY rp.created_at DESC LIMIT 200`,[status]);
+  r.json({reports:x.rows.map(v=>({id:Number(v.id),reason:v.reason,details:v.details||"",status:v.status,createdAt:v.created_at,
+    reporter:{name:v.reporter_name,code:v.reporter_code},
+    target:{id:Number(v.target_id),name:v.target_name,code:v.target_code,banned:!!v.banned_at}}))});
+}catch(e){console.error("admin-reports",e);r.status(500).json({error:"Não foi possível carregar as denúncias."})}});
+
+app.post("/api/admin/reports/:id/resolve",async(q,r)=>{try{
+  const admin=await requireAdmin(q,r);if(!admin)return;
+  const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Denúncia inválida."});
+  const x=await pool.query("UPDATE reports SET status='resolved' WHERE id=$1 RETURNING id",[id]);
+  if(!x.rowCount)return r.status(404).json({error:"Denúncia não encontrada."});
+  r.json({ok:true});
+}catch(e){console.error("admin-report-resolve",e);r.status(500).json({error:"Não foi possível atualizar a denúncia."})}});
+
+app.get("/api/admin/servers",async(q,r)=>{try{
+  const admin=await requireAdmin(q,r);if(!admin)return;
+  const search=String(q.query?.q||"").trim().slice(0,60),like=`%${search}%`;
+  const x=await pool.query(`SELECT c.id,c.name,c.description,c.is_public,c.icon,c.created_at,owner.name AS owner_name,owner.code AS owner_code,
+      (SELECT COUNT(*)::int FROM community_members cm WHERE cm.community_id=c.id) AS member_count
+    FROM communities c JOIN users owner ON owner.id=c.owner_id
+    WHERE ($1='' OR c.name ILIKE $2)
+    ORDER BY member_count DESC LIMIT 200`,[search,like]);
+  r.json({servers:x.rows.map(v=>({id:Number(v.id),name:v.name,description:v.description||"",isPublic:!!v.is_public,icon:v.icon||"🌐",createdAt:v.created_at,owner:{name:v.owner_name,code:v.owner_code},memberCount:v.member_count}))});
+}catch(e){console.error("admin-servers",e);r.status(500).json({error:"Não foi possível carregar os servidores."})}});
+
+app.delete("/api/admin/servers/:id",async(q,r)=>{try{
+  const admin=await requireAdmin(q,r);if(!admin)return;
+  const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Servidor inválido."});
+  const x=await pool.query("DELETE FROM communities WHERE id=$1 RETURNING id",[id]);
+  if(!x.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
+  r.json({ok:true});
+}catch(e){console.error("admin-server-delete",e);r.status(500).json({error:"Não foi possível excluir o servidor."})}});
+
+app.delete("/api/admin/posts/:id",async(q,r)=>{try{
+  const admin=await requireAdmin(q,r);if(!admin)return;
+  const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
+  const x=await pool.query("DELETE FROM social_posts WHERE id=$1 RETURNING id",[id]);
+  if(!x.rowCount)return r.status(404).json({error:"Publicação não encontrada."});
+  r.json({ok:true});
+}catch(e){console.error("admin-post-delete",e);r.status(500).json({error:"Não foi possível excluir a publicação."})}});
+
 
 /* Random matchmaking: fila persistente e resultado persistente no PostgreSQL. */
 function randomRoomId(){return "random-"+crypto.randomBytes(8).toString("hex")}
@@ -947,6 +1078,10 @@ app.post("/api/login",guard,async(q,r)=>{
     if(!ok){noteFailedLogin(key);await securityEvent(u.id,"LOGIN_FAILED",{ip,ua:q.headers["user-agent"]});return r.status(401).json({error:"E-mail ou senha incorretos."});}
     if(!u.email_verified_at){
       return r.status(403).json({error:"Confirme seu e-mail antes de entrar. Verifique sua caixa de entrada ou solicite um novo link.",verificationRequired:true});
+    }
+    if(u.banned_at){
+      await securityEvent(u.id,"LOGIN_BLOCKED_BANNED",{ip,ua:q.headers["user-agent"]});
+      return r.status(403).json({error:"Sua conta foi suspensa."+(u.ban_reason?" Motivo: "+u.ban_reason:"")+" Se acredita que isso é um engano, entre em contato com o suporte."});
     }
     clearFailedLogin(key);
     if(!String(u.password_hash).startsWith("scrypt$")){const upgraded=await hashPassword(p);await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2",[upgraded,u.id]);}
