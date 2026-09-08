@@ -154,6 +154,12 @@ async function initDb(){
  await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_duration REAL");
  await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_data BYTEA");
  await pool.query("CREATE INDEX IF NOT EXISTS direct_messages_pair_idx ON direct_messages(sender_id,receiver_id,created_at DESC)");
+ await pool.query(`CREATE TABLE IF NOT EXISTS direct_chat_pins(
+   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   other_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+   PRIMARY KEY(user_id,other_id)
+ )`);
  await pool.query(`CREATE TABLE IF NOT EXISTS app_sessions(
    token TEXT PRIMARY KEY,
    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1003,6 +1009,38 @@ app.get("/api/messages/unread",async(q,r)=>{
   const x=await pool.query(`SELECT u.code,COUNT(*)::int AS count FROM direct_messages m JOIN users u ON u.id=m.sender_id WHERE m.receiver_id=$1 AND m.read_at IS NULL GROUP BY u.code`,[me.id]);
   const unread={};x.rows.forEach(row=>unread[row.code]=Number(row.count||0));r.json({unread});
  }catch(e){console.error(e);r.status(500).json({error:"Não foi possível carregar notificações."})}
+});
+app.get("/api/messages/conversations",async(q,r)=>{
+ try{
+  const me=await auth(q,r);if(!me)return;
+  const x=await pool.query(`WITH ranked AS (
+    SELECT m.*,CASE WHEN m.sender_id=$1 THEN m.receiver_id ELSE m.sender_id END AS other_id,
+           ROW_NUMBER() OVER(PARTITION BY CASE WHEN m.sender_id=$1 THEN m.receiver_id ELSE m.sender_id END ORDER BY m.created_at DESC,m.id DESC) rn
+    FROM direct_messages m WHERE m.sender_id=$1 OR m.receiver_id=$1
+  )
+  SELECT r.other_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,r.id AS last_message_id,r.body AS last_body,
+         r.created_at AS last_created_at,r.sender_id AS last_sender_id,
+         CASE WHEN r.media_data IS NOT NULL THEN r.media_type ELSE NULL END AS last_media_type,
+         EXISTS(SELECT 1 FROM direct_chat_pins p WHERE p.user_id=$1 AND p.other_id=r.other_id) AS pinned,
+         (SELECT COUNT(*)::int FROM direct_messages um WHERE um.sender_id=r.other_id AND um.receiver_id=$1 AND um.read_at IS NULL) AS unread_count
+  FROM ranked r JOIN users u ON u.id=r.other_id
+  WHERE r.rn=1
+  ORDER BY pinned DESC,r.last_created_at DESC NULLS LAST`,[me.id]);
+  r.json({conversations:x.rows.map(v=>({code:v.code,name:v.name,avatarUrl:v.avatar_mime?`/api/avatar/${encodeURIComponent(v.code)}?v=${Number(v.avatar_updated_at||0)}`:null,lastMessage:{id:v.last_message_id,body:v.last_body||"",created_at:v.last_created_at,sender_id:v.last_sender_id,mediaType:v.last_media_type||null},pinned:!!v.pinned,unread:Number(v.unread_count||0)}))});
+ }catch(e){console.error("dm-conversations",e);r.status(500).json({error:"Não foi possível carregar suas conversas."})}
+});
+app.post("/api/messages/conversations/:code/pin",async(q,r)=>{
+ try{
+  const me=await auth(q,r);if(!me)return;
+  const other=await getUserByCode(String(q.params.code||"").trim().toUpperCase());if(!other)return r.status(404).json({error:"Usuário não encontrado."});
+  if(Number(other.id)===Number(me.id))return r.status(400).json({error:"Conversa inválida."});
+  const exists=await pool.query("SELECT 1 FROM direct_messages WHERE (sender_id=$1 AND receiver_id=$2) OR (sender_id=$2 AND receiver_id=$1) LIMIT 1",[me.id,other.id]);
+  if(!exists.rowCount)return r.status(404).json({error:"Essa conversa ainda não existe."});
+  const pinned=await pool.query("SELECT 1 FROM direct_chat_pins WHERE user_id=$1 AND other_id=$2",[me.id,other.id]);
+  if(pinned.rowCount){await pool.query("DELETE FROM direct_chat_pins WHERE user_id=$1 AND other_id=$2",[me.id,other.id]);return r.json({pinned:false});}
+  await pool.query("INSERT INTO direct_chat_pins(user_id,other_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[me.id,other.id]);
+  r.json({pinned:true});
+ }catch(e){console.error("dm-pin",e);r.status(500).json({error:"Não foi possível fixar a conversa."})}
 });
 app.get("/api/messages/:code",async(q,r)=>{
  try{
