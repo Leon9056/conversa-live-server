@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0a1020"><meta name="color-scheme" content="dark light">
+<meta name="description" content="FreeChat — chat, chamadas, música e compartilhamento de tela.">
+<title>FreeChat 1.6.6</title>
+<link rel="manifest" href="manifest.json"><link rel="icon" type="image/svg+xml" href="icon.svg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="fc-visual-overhaul">
+<section id="login" class="screen">
+  <div class="auth-card">
+    <div class="brand-icon brand-logo-icon"><img src="icon.svg" alt="FreeChat" width="46" height="46"></div><div class="auth-brand">FREECHAT <span>v1.6.6</span></div><h1>FreeChat</h1>
+    <p id="authSubtitle" class="muted">Entre na sua conta para continuar</p>
+    <div class="auth-tabs"><button id="loginTab" class="auth-tab active" type="button">Entrar</button><button id="registerTab" class="auth-tab" type="button">Criar conta</button></div>
+    <div id="registerFields" class="hidden"><label for="name">👤 Nome de usuário</label><input id="name" maxlength="24" autocomplete="name" placeholder="Como quer ser chamado?"></div>
+    <label id="emailLabel" for="email">📧 E-mail</label><input id="email" type="email" maxlength="120" autocomplete="email" inputmode="email" placeholder="voce@email.com">
+    <label id="passwordLabel" for="password">🔒 Senha</label><div class="password-wrap"><input id="password" type="password" maxlength="64" autocomplete="current-password" placeholder="Digite sua senha"><button id="togglePassword" class="icon-btn password-toggle" type="button" aria-label="Mostrar senha" aria-pressed="false"><svg class="eye-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
+    <div id="passwordStrength" class="password-strength hidden"><div class="strength-track"><span id="strengthBar"></span></div><span id="strengthText">Senha</span></div>
+    <div id="confirmPasswordWrap" class="hidden"><label for="confirmPassword">🔐 Confirmar senha</label><div class="password-wrap"><input id="confirmPassword" type="password" maxlength="64" autocomplete="new-password" placeholder="Digite a senha novamente"><button id="toggleConfirmPassword" class="icon-btn password-toggle" type="button" aria-label="Mostrar confirmação da senha" aria-pressed="false"><svg class="eye-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div>
+    <button id="loginBtn" class="primary-btn" type="button">🚀 Entrar</button>
+    <button id="forgotPasswordBtn" class="auth-link-btn" type="button">Esqueci minha senha</button>
+    <button id="resendVerificationBtn" class="auth-link-btn hidden" type="button">📩 Reenviar verificação de e-mail</button>
+    <div id="emailRecovery" class="auth-recovery hidden">
+      <div class="auth-recovery-head"><b>Recuperar acesso</b><button id="recoveryBackBtn" type="button">← Voltar</button></div>
+      <p class="muted">Digite seu e-mail e enviaremos um link para redefinir sua senha.</p>
+      <label for="recoveryEmail">📧 E-mail</label><input id="recoveryEmail" type="email" maxlength="120" autocomplete="email" placeholder="voce@email.com">
+      <button id="recoverySendBtn" class="primary-btn" type="button">📨 Enviar link</button>
+      <div id="recoveryStatus" class="status" role="status" aria-live="polite"></div>
+    </div>
+    <div id="resetPasswordBox" class="auth-recovery hidden">
+      <div class="auth-recovery-head"><b>Nova senha</b><button id="resetBackBtn" type="button">← Voltar</button></div>
+      <p class="muted">Escolha uma nova senha para sua conta.</p>
+      <label for="resetPassword">🔒 Nova senha</label><input id="resetPassword" type="password" maxlength="64" autocomplete="new-password" placeholder="Nova senha">
+      <label for="resetPasswordConfirm">🔐 Confirmar senha</label><input id="resetPasswordConfirm" type="password" maxlength="64" autocomplete="new-password" placeholder="Digite novamente">
+      <button id="resetPasswordBtn" class="primary-btn" type="button">🔐 Redefinir senha</button>
+      <div id="resetStatus" class="status" role="status" aria-live="polite"></div>
+    </div>
+    <div id="loginStatus" class="status" role="status" aria-live="polite"></div>
+    <small class="auth-note">🔒 Sua senha é protegida no servidor.</small>
+  </div>
+</section>
+<section id="callMenu" class="screen hidden">
+  <div class="call-menu-card menu-main-card">
+    <div class="menu-header">
+      <div class="brand-icon brand-logo-icon"><img src="icon.svg" alt="FreeChat" width="46" height="46"></div>
+      <div class="menu-greeting">
+        <span class="menu-eyebrow">SEU ESPAÇO DE CONVERSA</span>
+        <h1>Olá, <span id="welcomeName">usuário</span>! <span class="wave-emoji" aria-hidden="true">👋</span></h1>
+        <p class="muted">Tudo pronto para conversar, chamar seus amigos e compartilhar.</p>
+      </div>
+      <div class="profile-code menu-header-code"><span>Seu código</span><b id="myCode">CL-000000</b><button id="copyUserCode" type="button">📋 Copiar</button></div>
+      <button id="fullscreenBtn" class="feed-main-btn feed-main-btn-menu fullscreen-btn" type="button" title="Tela cheia">⛶ <span>Tela cheia</span></button>
+      <button id="feedBtnMenu" class="feed-main-btn feed-main-btn-menu" type="button" title="Abrir Feed">📰 <span>Feed</span></button>
+    </div>
+
+    <div class="menu-grid">
+      <div class="menu-col menu-col-actions">
+        <div class="menu-section-title">📞 Chamada</div>
+        <button type="button" id="createCallBtn" class="primary-btn big-btn">📞 Criar nova call</button>
+        <div class="call-actions-divider">ou</div>
+        <button type="button" id="joinCallBtn" class="secondary-btn big-btn">🔗 Entrar em uma call</button>
+        <div id="joinBox" class="join-box hidden">
+          <label>🔑 Código da call</label>
+          <input id="roomCodeInput" maxlength="32" placeholder="Ex.: ABC123">
+          <button type="button" id="confirmJoinBtn" class="primary-btn">🎧 Entrar na call</button>
+        </div>
+        <div id="menuStatus" class="status"></div>
+
+        <div class="menu-section-title menu-section-title-spaced">➕ Adicionar amigo</div>
+        <div class="friend-add-row"><input id="friendCodeInput" maxlength="20" placeholder="Código do amigo (ex.: CL-A1B2C3)"><button id="addFriendBtn" class="secondary-btn" type="button">📨 Convidar</button></div>
+        <div id="friendStatus" class="status"></div><small class="friend-help">Digite o código de alguém para enviar um convite de amizade.</small>
+      </div>
+
+      <div class="menu-col menu-col-friends">
+        <div class="friends-box">
+          <div class="friends-title"><b>👥 Amigos</b><button id="refreshFriends" type="button" title="Atualizar">↻</button></div>
+          <div class="friends-toolbar"><input id="friendsSearch" class="friends-search" placeholder="🔎 Procurar amigo por nome ou código" autocomplete="off"></div>
+          <div id="friendsList" class="friends-list"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="menu-quick-strip" aria-label="Ações rápidas">
+      <button type="button" class="menu-quick-card" data-menu-action="call">
+        <span class="menu-quick-icon">📞</span><span><b>Começar uma call</b><small>Crie uma sala em segundos</small></span><i>›</i>
+      </button>
+      <button type="button" class="menu-quick-card" data-menu-action="feed">
+        <span class="menu-quick-icon">📰</span><span><b>Ver o Feed</b><small>Veja novidades dos seus amigos</small></span><i>›</i>
+      </button>
+      <button type="button" class="menu-quick-card" data-menu-action="messages">
+        <span class="menu-quick-icon">💬</span><span><b>Mensagens</b><small>Converse direto com seus amigos</small></span><i>›</i>
+      </button>
+      <button type="button" class="menu-quick-card" data-menu-action="friend">
+        <span class="menu-quick-icon">👥</span><span><b>Adicionar amigo</b><small>Use o código de alguém</small></span><i>›</i>
+      </button>
+      <button type="button" class="menu-quick-card" data-menu-action="settings"><span class="menu-quick-icon">⚙️</span><span><b>Configurações</b><small>Privacidade, segurança e aparência</small></span><i>›</i></button>
+      <button type="button" class="menu-quick-card" data-menu-action="servers">
+        <span class="menu-quick-icon">🌐</span><span><b>Servidores</b><small>Crie ou entre numa comunidade</small></span><i>›</i>
+      </button>
+      <button type="button" class="menu-quick-card" data-menu-action="random">
+        <span class="menu-quick-icon">🎲</span><span><b>Conhecer alguém</b><small>Converse com alguém novo</small></span><i>›</i>
+      </button>
+      <button type="button" id="adminMenuCard" class="menu-quick-card admin-menu-card hidden" data-menu-action="admin">
+        <span class="menu-quick-icon">🛡️</span><span><b>Administração</b><small>Painel restrito</small></span><i>›</i>
+      </button>
+    </div>
+
+    <div class="menu-tip">
+      <span class="menu-tip-dot"></span>
+      <span><b>Dica rápida</b> — você pode entrar em uma call e ajustar áudio, microfone e transmissão antes de começar.</span>
+    </div>
+
+    <button id="supportCreatorBtn" class="support-creator-btn" type="button">💜 Apoie o criador <span>PIX</span></button>
+    <button id="logoutBtn" class="logout-btn" type="button">Sair da conta</button>
+  </div>
+</section>
+
+<div id="app" class="hidden">
+<header class="global-topbar" aria-label="Barra principal">
+  <div class="global-brand"><span class="global-brand-icon"><img src="icon.svg" alt="" width="24" height="24"></span><b>FreeChat</b><span class="global-version">1.6.6</span></div>
+  <div class="global-search"><span>⌕</span><input id="globalSearchInput" type="search" placeholder="Buscar conversas, amigos ou usuários..." autocomplete="off"><kbd>Ctrl K</kbd></div>
+  <div class="global-actions">
+    <button id="globalNotificationsBtn" class="global-action-btn" type="button" title="Notificações">🔔<span class="global-badge hidden" id="globalNotificationBadge">0</span></button>
+    <button id="globalFriendsBtn" class="global-action-btn" type="button" title="Amigos">👥</button>
+    <button id="globalSettingsBtn" class="global-action-btn" type="button" title="Configurações">⚙️</button>
+    <div class="global-user"><span id="globalUserAvatar" class="global-user-avatar">?</span><span><b id="globalUserName">Usuário</b><small>● Online</small></span><span class="global-chevron">⌄</span></div>
+  </div>
+</header>
+<aside class="side">
+  <div class="brand"><span class="mini mini-logo"><img src="icon.svg" alt="" width="20" height="20"></span><b>FreeChat</b></div>
+  <div class="label">SALA</div><div class="room" id="roomName"># geral</div>
+  <div class="status" id="status">Desconectado</div>
+  <div class="menu-welcome"><div class="menu-welcome-icon">💬</div><div><small>Bem-vindo de volta</small><b id="sideWelcomeName">Usuário</b></div></div><div class="side-tools"><button type="button" id="invite" class="secondary">🔗 Copiar convite</button><span class="side-code">ID: <b id="sideCode">CL-000000</b></span><button id="feedBtn" class="feed-main-btn" type="button" title="Abrir Feed">📰 <span>Feed</span><small>Fotos e vídeos até 1 min</small></button><div class="side-action-row">
+<button id="friendsBtn" class="icon-header" type="button" title="Amigos">👥<span>Amigos</span></button>
+<button id="socialBtn" class="icon-header" type="button" title="Social">🌎<span>Social</span></button>
+<button id="serversBtn" class="icon-header" type="button" title="Servidores">🌐<span>Servidores</span></button>
+<button id="randomCallBtn" class="icon-header" type="button" title="Conhecer alguém">🎲<span>Conhecer</span></button>
+<button id="directMessagesBtn" class="icon-header" type="button" title="Mensagens">💬<span>Mensagens</span></button>
+<button id="settingsBtn" class="icon-header" type="button" title="Configurações" aria-label="Configurações">⚙️<span>Config.</span></button>
+</div></div>
+  <button id="leaveChat" class="leave-chat-btn" type="button" title="Sair do chat e voltar ao menu">🚪 Sair do chat</button>
+  <div class="label">PARTICIPANTES</div><div id="people"></div>
+  <div class="me"><span id="avatar">?</span><div><b id="me">Você</b><small>Online</small></div></div>
+</aside>
+<aside id="profileSidebar" class="profile-sidebar" aria-label="Perfil do usuário">
+  <div class="profile-summary profile-summary-user">
+    <div id="profileSidebarAvatar" class="profile-sidebar-avatar">?</div>
+    <b id="profileSidebarName">Usuário</b>
+    <small><span class="profile-online-dot"></span> Online</small>
+    <span id="profileSidebarCode" class="profile-sidebar-code">CL-000000</span>
+  </div>
+  <div class="profile-action-grid profile-action-grid-user">
+    <button id="profileSettingsBtn" type="button"><span>♙</span><small>Perfil</small></button>
+    <button id="profileFriendsBtn" type="button"><span>♧</span><small>Amigos</small></button>
+    <button id="profileSupportBtnTop" type="button"><span>♥</span><small>Apoiar</small></button>
+    <button id="profileMoreBtn" type="button" title="Mais">•••</button>
+  </div>
+  <div class="profile-divider"></div>
+  <section class="profile-section"><b>Sobre você</b><p id="profileSidebarAbout">Seu perfil do FreeChat.</p></section>
+  <section class="profile-section"><b>Status</b><p><span class="profile-online-dot"></span> Online</p></section>
+  <section class="profile-section"><b>Conta</b>
+    <button type="button" id="profileEditBtn">✎ <span>Editar perfil</span></button>
+    <button type="button" id="profileCopyCodeBtn">▣ <span>Copiar meu código</span></button>
+    <button type="button" id="profileNotificationsBtn">♧ <span>Notificações</span></button>
+    <button type="button" id="profileLogoutBtn">⇥ <span>Sair da conta</span></button>
+  </section>
+  <button id="profileSupportBtn" class="profile-support" type="button"><span>♥</span><span><b>Apoie o criador</b><small>Ajude a manter o FreeChat online!</small></span><i>›</i></button>
+</aside>
+<div id="friendsPanel" class="friends-panel hidden"><div class="friends-panel-head"><b>👥 Amigos</b><button id="friendsClose" class="panel-close-x" type="button" aria-label="Fechar amigos" title="Fechar">×</button></div><div class="friend-add-row"><input id="friendCodeApp" maxlength="20" placeholder="Código CL-XXXXXX"><button id="addFriendApp" class="secondary-btn" type="button" title="Enviar convite">📨</button></div><div id="friendAppStatus" class="status"></div><div class="friends-toolbar"><input id="friendsSearchApp" class="friends-search" placeholder="🔎 Procurar amigo..." autocomplete="off"></div><div id="friendsAppList" class="friends-list"></div></div>
+<main class="main">
+<header><div><b># <span id="headRoom">geral</span></b><small>Conversa em tempo real</small></div>
+<div class="header-actions"><div id="connectionMeter" class="connection-meter"><div class="connection-bars"><i></i><i></i><i></i><i></i><i></i></div><span id="connectionText">Conectando...</span></div><button type="button" id="callOpen">🎥 Call</button></div></header>
+<section id="messages" class="messages"><div class="empty-chat" id="emptyChat"><div>💬</div><b>Comece a conversa</b><span>Envie uma mensagem para a sala.</span></div></section>
+<div id="emojiPicker" class="emoji-picker hidden" aria-label="Seletor de emojis">
+  <div class="emoji-picker-head">
+    <b>Emojis</b>
+    <button type="button" id="emojiClose" class="emoji-close">×</button>
+  </div>
+  <input id="emojiSearch" class="emoji-search" placeholder="Pesquisar emoji..." autocomplete="off">
+  <div class="emoji-tabs" id="emojiTabs"></div>
+  <div class="emoji-grid" id="emojiGrid"></div>
+</div>
+<div id="typingStatus" class="typing-status" aria-live="polite"></div>
+<form id="form" class="composer"><button type="button" id="emoji" class="tool" title="Emojis" aria-label="Abrir emojis">☺</button><input id="msg" maxlength="1000" autocomplete="off" placeholder="Escreva uma mensagem..." aria-label="Mensagem"><span id="msgCount" class="msg-count">0/1000</span><button type="submit" class="send" title="Enviar" aria-label="Enviar mensagem">➤</button></form>
+</main>
+
+<section id="call" class="call hidden">
+ <div class="callHead">
+   <div class="call-head-title"><span class="call-live-dot"></span><div><b>Chamada ao vivo</b><small id="callRoomLabel"># geral</small></div></div>
+   <div class="call-head-actions">
+     <span class="mobile-call-position" id="mobileCallPosition">1/3 • Call</span>
+     <button id="callParticipantsBtn" class="call-head-btn" type="button" title="Participantes">👥 <span id="callParticipantCount">0</span></button>
+     <button id="callSettingsBtn" class="call-head-btn" type="button" title="Configurações">⚙️️</button>
+     <button id="callClose" class="call-head-btn close-call" type="button" aria-label="Fechar">×</button>
+   </div>
+ </div>
+ <div class="mobile-swipe-hint" id="mobileSwipeHint">Deslize ← para o chat • deslize novamente para Social</div>
+ <div class="call-stage">
+   <div id="callStageBadge" class="call-stage-badge">● AO VIVO <span id="callQualityText">Conectando...</span></div>
+   <div id="screenShareBanner" class="screen-share-banner hidden">🖥️ <span>Tela compartilhada</span><button id="focusStageBtn" type="button">Focar</button></div>
+   <div id="videos" class="videos"></div>
+   <div id="callEmptyState" class="call-empty-state"><div class="call-empty-icon">🎥</div><b>Aguardando participantes</b><span>Quando alguém entrar, o vídeo aparecerá aqui.</span></div>
+ </div>
+ <div id="callSidePanel" class="call-side-panel hidden">
+   <div class="call-panel-head"><b id="callPanelTitle">Amigos na call</b><button id="callPanelClose" class="icon-btn panel-close-x" type="button" aria-label="Fechar amigos na call" title="Fechar">×</button></div>
+   <div id="callPanelContent" class="call-panel-content"></div>
+ </div>
+ <div id="musicBot" class="music-bot idle"><div class="music-icon">🎵</div><div class="music-info"><b class="music-title">Nenhuma música tocando</b><small class="music-meta">Abra 🎵 Música para buscar e controlar</small><div class="music-progress"><div class="music-progress-fill"></div></div></div><span class="music-queue-count"></span><button id="musicSkip" class="music-skip" type="button" disabled title="Próxima">⏭</button><button id="musicStop" class="music-stop" type="button" disabled title="Parar e limpar fila">⏹</button></div>
+ <div class="call-controls-wrap">
+   <button id="audioUnlock" class="audio-unlock-banner hidden" type="button"><span class="control-icon">🔊</span><span>Toque para ativar o áudio</span></button>
+   <div class="call-controls-top"><span id="callStatus" class="callStatus" aria-live="polite">Pronto.</span><span id="callStatsMini">-- ms • -- fps</span></div>
+   <div class="controls">
+    <button type="button" id="mic" title="Microfone"><span class="control-icon">🎙️</span><span>Microfone</span></button>
+    <button type="button" id="cam" title="Câmera"><span class="control-icon">📷</span><span>Câmera</span></button>
+    <button type="button" id="screen" title="Compartilhar tela"><span class="control-icon">🖥️</span><span>Tela</span></button>
+    <button type="button" id="callVolumeBtn" title="Volume da call"><span class="control-icon">🔊</span><span>Volume</span></button>
+    <button type="button" id="callMusicBtn" title="Música"><span class="control-icon">🎵</span><span>Música</span></button>
+    <button type="button" id="callParticipantsBtnBottom" title="Participantes"><span class="control-icon">👥</span><span>Pessoas</span></button>
+    <button type="button" id="hang" class="danger" title="Sair da chamada"><span class="control-icon">☎</span><span>Sair</span></button>
+   </div>
+ </div>
+ <div id="callMusicPanel" class="call-float-panel hidden">
+   <div><b>🎵 Central de música</b><button id="callMusicClose" class="icon-btn" type="button">×</button></div>
+   <div class="music-now-card">
+     <div class="music-now-art" id="musicNowArt">🎵</div>
+     <div class="music-now-info"><b id="musicNowTitle">Nenhuma música tocando</b><small id="musicNowArtist">—</small><div class="music-progress"><div id="musicPanelProgress" class="music-progress-fill"></div></div><small id="musicNowTime">0:00 / 0:00</small></div>
+   </div>
+   <div class="music-panel-actions">
+     <button id="musicPause" type="button">⏸ Pausar</button><button id="musicResume" type="button">▶ Retomar</button><button id="musicSkipPanel" type="button">⏭ Próxima</button><button id="musicStopPanel" type="button" class="music-danger">⏹ Parar</button>
+   </div>
+   <div class="music-local-volume"><div class="music-volume-head"><span>🔊 Meu volume</span><b id="musicLocalVolumeValue">70%</b></div><input id="musicLocalVolume" type="range" min="0" max="100" value="70" aria-label="Meu volume da música"><button id="musicLocalMute" class="music-local-mute" type="button">🔊 Som ligado</button></div>
+   <div class="music-shared-volume"><div class="music-volume-head"><span>📡 Volume transmitido</span><b id="musicSharedVolumeValue">70%</b></div><input id="musicSharedVolume" type="range" min="0" max="100" value="70" aria-label="Volume transmitido da música"></div>
+   <div class="music-queue-head"><b>Fila</b><span id="musicPanelQueueCount">0 faixas</span></div>
+   <div id="musicPanelQueue" class="music-queue"></div>
+   <p>Busque uma faixa para tocar agora ou adicionar à fila.</p>
+   <div class="call-music-search"><input id="callMusicSearch" placeholder="Ex.: música, artista..." autocomplete="off"><button id="callMusicSearchBtn" type="button">Buscar</button></div>
+   <div id="callMusicResults"></div>
+   <small id="musicPanelHostHint" class="music-host-hint"></small>
+ </div>
+ <div id="callSettingsPanel" class="call-float-panel hidden">
+   <div><b>⚙️ Áudio e transmissão</b><button id="callSettingsClose" class="icon-btn" type="button">×</button></div>
+   <div class="settings-subtitle">Microfone</div>
+   <label class="call-setting-field"><span>Entrada</span><select id="micDeviceSelect"><option value="">Microfone padrão</option></select></label>
+   <label class="call-setting-row"><span>Cancelamento de eco</span><input id="echoCancellationToggle" type="checkbox" checked></label>
+   <label class="call-setting-row"><span>Redução de ruído</span><input id="noiseSuppressionToggle" type="checkbox" checked></label>
+   <label class="call-setting-row"><span>Ganho automático</span><input id="autoGainToggle" type="checkbox" checked></label>
+   <div class="settings-subtitle">Transmissão</div>
+   <label class="call-setting-field"><span>Qualidade de vídeo</span><select id="videoQualitySelect"><option value="low">Econômica • 360p</option><option value="medium">Equilibrada • 480p</option><option value="high">Alta • 720p</option><option value="ultra">Máxima • 1080p</option></select></label>
+   <label class="call-setting-row"><span>Ajuste automático de qualidade</span><input id="autoQualityToggle" type="checkbox" checked></label>
+   <label class="call-setting-field"><span>Saída de áudio</span><select id="audioOutputSelect"><option value="">Saída padrão</option></select></label>
+   <label class="call-setting-field"><span>Volume da call <b id="callOutputVolumeValue">100%</b></span><input id="callOutputVolume" type="range" min="0" max="100" value="100"></label>
+   <label class="call-setting-row"><span>Reduzir animações</span><input id="reduceCallMotion" type="checkbox"></label>
+   <div class="call-settings-actions"><button id="refreshAudioDevices" type="button">↻ Atualizar dispositivos</button><button id="testMicBtn" type="button">🎙️ Testar microfone</button></div>
+   <div id="micTestMeter" class="mic-test-meter"><i></i></div>
+   <div class="call-stats-grid"><span>Ping <b id="callPingValue">--</b></span><span>FPS <b id="callFpsValue">--</b></span><span>Vídeo <b id="callResValue">--</b></span><span>Perda <b id="callLossValue">--</b></span></div>
+   <small class="settings-note">Algumas opções dependem do navegador e do hardware. O FreeChat aplica a melhor configuração disponível sem interromper a chamada.</small>
+ </div>
+</section>
+<div id="mobileNav" class="mobile-nav hidden" aria-label="Navegação mobile durante a call">
+  <button type="button" data-mobile-view="0" class="active"><span>🎥</span><small>Call</small></button>
+  <button type="button" data-mobile-view="1"><span>💬</span><small>Chat</small></button>
+  <button type="button" data-mobile-view="2"><span>👥</span><small>Social</small></button>
+</div>
+</div>
+
+<div id="settingsPanel" class="modal hidden" role="dialog" aria-modal="true"><div class="modal-card settings-card"><div class="settings-head"><div><b>⚙️ Configurações</b><small>Personalize o visual e o comportamento do FreeChat</small></div><button id="settingsClose" class="icon-btn" type="button" aria-label="Fechar">×</button></div><section class="settings-section"><h3>🎨 Tema do aplicativo</h3><p>O tema altera o conjunto de cores de toda a interface.</p><div id="themeChoices" class="theme-choices"></div></section><section class="settings-section"><h3>✨ Aparência</h3><label class="settings-toggle"><span>Animações reduzidas</span><input id="reduceMotionToggle" type="checkbox"></label><label class="settings-toggle"><span>Tema claro/escuro</span><button id="modeToggle" class="secondary-btn small-btn" type="button">Alternar modo</button></label></section><section class="settings-section"><h3>🔐 Segurança</h3><p>Proteções da sua conta, sessões e senha.</p><div class="security-actions"><button id="securityRefresh" class="secondary-btn small-btn" type="button">↻ Atualizar</button><button id="securityRevokeAll" class="secondary-btn small-btn" type="button">Encerrar outros dispositivos</button></div><div id="securitySessions" class="security-list"><span class="muted">Carregando sessões...</span></div><div class="security-password"><b>Alterar senha</b><div class="security-password-grid"><input id="currentPassword" type="password" autocomplete="current-password" placeholder="Senha atual"><input id="newPassword" type="password" autocomplete="new-password" placeholder="Nova senha (10+ caracteres)"></div><button id="changePasswordBtn" class="primary-btn small-btn" type="button">Alterar senha</button><div id="securityStatus" class="status"></div></div></section><section class="settings-section"><h3>🛡️ Privacidade</h3><div class="privacy-grid"><label>Mensagens<select id="privacyMessages"><option value="everyone">Todos</option><option value="friends">Amigos</option><option value="nobody">Ninguém</option></select></label><label>Chamadas<select id="privacyCalls"><option value="everyone">Todos</option><option value="friends">Amigos</option><option value="nobody">Ninguém</option></select></label><label>Pedidos de amizade<select id="privacyFriends"><option value="everyone">Aceitar de todos</option><option value="friends">Somente amigos de amigos</option><option value="nobody">Não aceitar pedidos</option></select></label></div><label class="settings-toggle privacy-random-toggle"><span>Permitir “Conhecer alguém”</span><input id="privacyRandom" type="checkbox"></label><small class="privacy-note">Quando ativado, você pode entrar na fila e ser pareado com outra pessoa que também optou por participar.</small><button id="savePrivacyBtn" class="primary-btn small-btn" type="button">Salvar privacidade</button></section><section class="settings-section"><h3>🚫 Bloqueios</h3><div id="blockedUsers" class="security-list"><span class="muted">Nenhum bloqueio carregado.</span></div></section></div></div>
+
+<div id="socialPanel" class="modal hidden" role="dialog" aria-modal="true">
+ <div class="modal-card social-card social-v3-card">
+  <header class="social-v3-head">
+   <div class="social-v3-title"><div class="social-v3-logo">✦</div><div><b>Social</b><small>Seu centro social no FreeChat</small></div></div>
+   <div class="social-v3-head-actions"><button id="socialRefreshFriends" class="icon-btn" type="button" title="Atualizar">↻</button><button id="socialClose" class="icon-btn" type="button" aria-label="Fechar">×</button></div>
+  </header>
+  <div class="social-v3-layout">
+   <aside class="social-v3-sidebar">
+    <button class="social-v3-nav active" data-social-tab="profile" type="button"><span>👤</span><div><b>Meu perfil</b><small>Identidade e atividade</small></div></button>
+    <button class="social-v3-nav" data-social-tab="friends" type="button"><span>👥</span><div><b>Amigos</b><small>Conexões e convites</small></div></button>
+    <button class="social-v3-nav" data-social-tab="notifications" type="button"><span>🔔</span><div><b>Notificações</b><small>O que aconteceu</small></div><span id="notificationBadge" class="mini-badge hidden">0</span></button>
+    <div class="social-v3-sidebar-spacer"></div>
+    <div class="social-v3-tip"><span>✨</span><b>Seu espaço</b><small>Publique no Feed e mantenha suas conexões por perto.</small></div>
+   </aside>
+   <main class="social-v3-main">
+    <section id="socialProfile" class="social-section social-v3-section">
+      <div class="profile-v3-cover"><div class="profile-v3-orb orb-a"></div><div class="profile-v3-orb orb-b"></div><div class="profile-v3-cover-content"><span>FREECHAT / PROFILE</span><b id="profileHeroCode">CL-000000</b></div></div>
+      <div class="profile-v3-main">
+       <button id="profileAvatarBtn" class="profile-v3-avatar profile-avatar-btn" type="button" title="Trocar foto de perfil"><span id="profileAvatar">?</span><span class="profile-avatar-edit">📷</span></button>
+       <div class="profile-v3-identity"><h1 id="profileName">Usuário</h1><p>@<span id="profileHandle">CL-000000</span></p><div class="profile-v3-status"><i></i> Online agora</div></div>
+       <div class="profile-v3-actions"><button id="profileCopyCodeBtnV3" class="secondary-btn small-btn" type="button">▣ Copiar código</button><button id="profileEditBtnV3" class="primary-btn small-btn" type="button">✎ Editar</button></div>
+      </div>
+      <div class="profile-v3-grid">
+       <div class="profile-v3-stat"><b id="profileFriendsCount">—</b><span>Amigos</span></div><div class="profile-v3-stat"><b id="profilePostsCount">—</b><span>Publicações</span></div><div class="profile-v3-stat"><b id="profileServersCount">—</b><span>Servidores</span></div>
+      </div>
+      <div class="profile-v3-panels">
+       <article><div class="profile-panel-title"><b>Sobre você</b><span>✦</span></div><p id="profileSocialAbout">Você ainda não adicionou uma descrição.</p><div class="profile-code-box"><span>Seu código</span><b id="profileCode">CL-000000</b></div></article>
+       <article><div class="profile-panel-title"><b>Conta rápida</b><span>⚡</span></div><button id="profileEditBtnV3Row" type="button" class="profile-v3-row">✎ <span>Editar perfil</span><i>›</i></button><button id="profileNotificationsBtnV3" type="button" class="profile-v3-row">🔔 <span>Notificações</span><i>›</i></button><button id="profileSupportBtnTopV3" type="button" class="profile-v3-row">💜 <span>Apoiar o FreeChat</span><i>›</i></button></article>
+      </div>
+      <div class="profile-v3-editor hidden" id="profileEditor">
+       <div class="profile-panel-title"><b>Editar perfil</b><button id="profileEditorClose" class="icon-btn" type="button">×</button></div>
+       <label>Nome de usuário</label><input id="profileNameInput" maxlength="24" placeholder="Seu nome"><div class="profile-v3-editor-actions"><button id="removeAvatarBtn" class="text-btn hidden" type="button">Remover foto</button><button id="saveProfileBtn" class="primary-btn small-btn" type="button">Salvar alterações</button></div><div id="profileStatus" class="status"></div>
+      </div>
+      <input id="profileAvatarInput" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden>
+    </section>
+    <section id="socialFriends" class="social-section social-v3-section hidden">
+      <div class="social-v3-section-head"><div><span>CONEXÕES</span><h2>Seus amigos</h2><small>Converse, chame ou encontre novas conexões.</small></div><button id="profileFriendsBtnV3" class="secondary-btn small-btn" type="button">＋ Adicionar</button></div>
+      <div class="friends-toolbar friends-v3-toolbar"><input id="socialFriendsSearch" class="friends-search" placeholder="🔎 Procurar por nome ou código..." autocomplete="off"></div>
+      <div id="socialFriendsList" class="friends-list friends-v3-list"></div>
+    </section>
+    <section id="socialNotifications" class="social-section social-v3-section hidden">
+      <div class="social-v3-section-head"><div><span>ATIVIDADE</span><h2>Notificações</h2><small>Convites, curtidas e atualizações da sua rede.</small></div><button id="markNotificationsRead" class="secondary-btn small-btn" type="button">Marcar como lidas</button></div>
+      <div id="notificationList" class="notification-list notifications-v3-list"></div>
+    </section>
+   </main>
+  </div>
+ </div>
+</div>
+
+<section id="feedScreen" class="screen feed-screen hidden">
+ <header class="feed-topbar">
+  <button id="feedBack" class="icon-btn" type="button" aria-label="Voltar">‹</button>
+  <div class="feed-brand"><span class="feed-brand-mark">✦</span><div><b>FreeChat</b><small>Social</small></div></div>
+  <div class="feed-topbar-actions"><button id="feedRefreshBtn" class="icon-btn" type="button" aria-label="Atualizar" title="Atualizar">↻</button><button id="feedNewPostBtn" class="icon-btn" type="button" aria-label="Nova publicação" title="Nova publicação">➕</button></div>
+ </header>
+ <div class="feed-scroll">
+  <nav class="feed-tabs feed-tiktok-tabs" aria-label="Filtro do feed"><button type="button" class="feed-tab" data-feed-filter="following">Seguindo</button><button type="button" class="feed-tab active" data-feed-filter="for_you">Para você</button><button id="feedRefreshBtnAlt" type="button" class="feed-tab-action" title="Atualizar">↻</button></nav>
+  <section class="feed-stories" aria-label="Amigos recentes"><div class="stories-title"><b>Momentos</b><small>Amigos ativos e recentes</small></div><div id="feedStories" class="stories-row"></div></section>
+  <section class="feed-composer-inline"><div id="feedComposerAvatar" class="composer-avatar">?</div><button id="feedInlineComposer" type="button">Compartilhe algo com seus amigos...</button><button id="feedInlineMedia" class="composer-media" type="button" aria-label="Adicionar mídia">＋</button></section>
+  <button id="feedNewPostsBanner" class="feed-new-posts-banner hidden" type="button">🆕 Novas publicações — toque para atualizar</button>
+  <div id="feedList" class="feed-ig-list"></div>
+  <div id="feedLoadMore" class="feed-load-more hidden"><span class="feed-spinner"></span><span>Carregando mais publicações...</span></div>
+  <div id="feedEndState" class="feed-end-state hidden">Você chegou ao fim ✦</div>
+ </div>
+ <button id="feedFab" class="feed-fab" type="button" title="Nova publicação">＋</button>
+</section>
+
+
+
+<div id="serversPanel" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="serversTitle">
+  <div class="modal-card servers-card servers-v2-card">
+    <div class="servers-v2-top">
+      <div class="servers-v2-brand">
+        <div class="servers-v2-logo">🌐</div>
+        <div><b id="serversTitle">Servidores</b><small>Suas comunidades em um só lugar.</small></div>
+      </div>
+      <div class="servers-head-actions">
+        <button id="serverJoinToggleBtn" class="secondary-btn small-btn" type="button">🔗 Entrar</button>
+        <button id="serverCreateToggleBtn" class="primary-btn small-btn" type="button">＋ Criar</button>
+        <button id="serversClose" class="icon-btn" type="button" aria-label="Fechar">×</button>
+      </div>
+    </div>
+
+    <section class="servers-v2-hero">
+      <div><span class="servers-eyebrow">COMUNIDADES</span><h2>Encontre onde você pertence.</h2><p>Crie um espaço, descubra comunidades públicas ou entre com um convite.</p></div>
+      <div class="servers-v2-hero-actions"><button id="serversDiscoverHeroBtn" class="secondary-btn" type="button">Explorar comunidades</button><button id="serversMyHeroBtn" class="ghost-btn" type="button">Meus servidores</button></div>
+    </section>
+
+    <section id="serverCreateBox" class="servers-create-box hidden">
+      <div class="servers-box-title"><div><b>Criar comunidade</b><small>Você será o proprietário e administrador.</small></div><span>✨</span></div>
+      <div class="servers-form-grid"><input id="serverNameInput" maxlength="48" placeholder="Nome do servidor"><input id="serverDescInput" maxlength="180" placeholder="Descrição curta"><select id="serverVisibilityInput"><option value="public">🌍 Público — aparece em Descobrir</option><option value="private">🔒 Privado — somente por convite</option></select></div>
+      <div class="servers-inline-actions"><button id="serverCreateCancelBtn" class="text-btn" type="button">Cancelar</button><button id="serverCreateBtn" class="primary-btn small-btn" type="button">Criar servidor</button></div>
+    </section>
+    <section id="serverJoinBox" class="servers-join-box hidden">
+      <div class="servers-box-title"><div><b>Entrar por convite</b><small>Digite um código no formato FR-XXXXXXXX.</small></div><span>🔗</span></div>
+      <div class="servers-join-row"><input id="serverInviteInput" maxlength="16" placeholder="FR-XXXXXXXX" autocomplete="off"><button id="serverJoinBtn" class="secondary-btn" type="button">Entrar</button></div>
+    </section>
+
+    <div class="servers-v2-toolbar">
+      <div class="servers-search-wrap"><span>⌕</span><input id="serverSearchInput" type="search" maxlength="60" placeholder="Pesquisar por nome ou descrição..." autocomplete="off"></div>
+      <button id="serversRefreshBtn" class="icon-btn servers-refresh" type="button" title="Atualizar" aria-label="Atualizar">↻</button>
+    </div>
+    <div id="serversStatus" class="status"></div>
+    <nav class="servers-tabs servers-v2-tabs" aria-label="Filtro de servidores"><button type="button" class="servers-tab active" data-servers-tab="mine">Meus servidores <span id="myServersCount" class="servers-count">0</span></button><button type="button" class="servers-tab" data-servers-tab="discover">Descobrir</button></nav>
+
+    <section id="myServersSection"><div id="myServersList" class="servers-list servers-v2-list"></div></section>
+    <section id="discoverServersSection" class="hidden"><div id="discoverServersList" class="servers-list servers-v2-list"></div></section>
+
+    <section id="serverDetailSection" class="hidden server-detail server-detail-v2">
+      <div class="server-detail-head"><button id="serverDetailBack" class="icon-btn" type="button" aria-label="Voltar">‹</button><div class="server-detail-icon" id="serverDetailIcon">S</div><div class="server-detail-info"><b id="serverDetailName">Servidor</b><small id="serverDetailDesc"></small><span id="serverDetailMeta" class="server-detail-meta"></span></div><div class="server-detail-actions"><button id="serverInviteCopyBtn" class="icon-btn hidden" type="button" title="Copiar convite" aria-label="Copiar convite">📋</button><button id="serverManageBtn" class="icon-btn hidden" type="button" title="Gerenciar servidor" aria-label="Gerenciar servidor">⚙</button><button id="serverLeaveBtn" class="icon-btn" type="button" title="Sair do servidor" aria-label="Sair do servidor">↪</button></div></div>
+      <div id="serverInviteCodeView" class="server-invite-code hidden"></div>
+      <div class="server-detail-layout server-detail-v3-layout"><aside class="server-channel-sidebar"><div class="server-channel-sidebar-head"><span>CANAIS</span><button id="serverAddChannelBtn" class="icon-btn hidden" type="button" title="Novo canal">＋</button></div><div id="serverChannelsList" class="server-channels"></div><div class="server-sidebar-footer"><small>Comunidade</small><b id="serverSidebarMemberCount">0 membros</b></div></aside><div class="server-detail-main"><div class="server-welcome-banner"><div><span>COMUNIDADE ATIVA</span><h3 id="serverWelcomeTitle">Bem-vindo</h3><p id="serverWelcomeDesc">Escolha um canal para começar.</p></div><div class="server-welcome-mark">✦</div></div><div class="server-detail-grid"><section class="server-info-panel"><div class="server-panel-title"><b>Sobre a comunidade</b><span>🌐</span></div><p id="serverAboutText">—</p><div class="server-stat-row"><span><b id="serverMemberStat">0</b> membros</span><span><b id="serverChannelStat">0</b> canais</span><span><b id="serverTypeStat">Público</b></span></div></section><section class="server-members-panel"><div class="server-panel-title"><b>Membros</b><span>👥</span></div><div id="serverMembersList" class="server-members-list"><span class="muted">Carregando…</span></div></section></div></div></div>
+    </section>
+  </div>
+</div>
+
+<div id="adminPanel" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="adminTitle">
+  <div class="modal-card admin-card">
+    <div class="settings-head">
+      <div><b id="adminTitle">🛡️ Painel de administração</b><small>Acesso restrito.</small></div>
+      <button id="adminClose" class="icon-btn" type="button" aria-label="Fechar">×</button>
+    </div>
+    <nav class="admin-tabs" aria-label="Seções do painel">
+      <button type="button" class="admin-tab active" data-admin-tab="overview">Visão geral</button>
+      <button type="button" class="admin-tab" data-admin-tab="users">Usuários</button>
+      <button type="button" class="admin-tab" data-admin-tab="reports">Denúncias <span id="adminReportsBadge" class="servers-count hidden">0</span></button>
+      <button type="button" class="admin-tab" data-admin-tab="servers">Servidores</button>
+    </nav>
+
+    <section id="adminOverview" class="admin-section">
+      <div id="adminStatsGrid" class="admin-stats-grid"><div class="servers-empty mini"><div>…</div><b>Carregando…</b></div></div>
+    </section>
+
+    <section id="adminUsers" class="admin-section hidden">
+      <div class="admin-search-row"><input id="adminUserSearch" type="search" placeholder="Buscar por nome, e-mail ou código..." autocomplete="off"><button id="adminUserSearchBtn" class="secondary-btn small-btn" type="button">Buscar</button></div>
+      <div id="adminUsersList" class="admin-users-list"></div>
+    </section>
+
+    <section id="adminReports" class="admin-section hidden">
+      <div class="admin-search-row"><select id="adminReportsFilter"><option value="open">Abertas</option><option value="resolved">Resolvidas</option><option value="all">Todas</option></select></div>
+      <div id="adminReportsList" class="admin-reports-list"></div>
+    </section>
+
+    <section id="adminServers" class="admin-section hidden">
+      <div class="admin-search-row"><input id="adminServerSearch" type="search" placeholder="Buscar servidor por nome..." autocomplete="off"><button id="adminServerSearchBtn" class="secondary-btn small-btn" type="button">Buscar</button></div>
+      <div id="adminServersList" class="admin-servers-list"></div>
+    </section>
+  </div>
+</div>
+
+<div id="supportCreatorModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="supportCreatorTitle">
+  <div class="modal-card support-card">
+    <div class="support-head">
+      <div><b id="supportCreatorTitle">💜 Apoie o criador</b><small>Se você gosta do FreeChat, qualquer ajuda é muito bem-vinda.</small></div>
+      <button id="supportCreatorClose" class="icon-btn" type="button" aria-label="Fechar">×</button>
+    </div>
+    <div class="pix-layout">
+      <div class="pix-qr-wrap"><img src="pix-qr.png" alt="QR Code para apoiar o criador via PIX" width="220" height="220" loading="eager"></div>
+      <div class="pix-details">
+        <span class="pix-label">PIX</span>
+        <p>Use a chave PIX abaixo ou escaneie o QR Code.</p>
+        <div class="pix-key-box"><code id="pixKey">3c971f28-584b-45ec-8171-bf20dda2864e</code><button id="copyPixBtn" type="button" class="secondary-btn small-btn">📋 Copiar chave PIX</button></div>
+        <div id="pixCopyStatus" class="status" role="status" aria-live="polite"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="reportModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="reportModalTitle">
+  <div class="modal-card report-card">
+    <div class="settings-head">
+      <div><b id="reportModalTitle">⚑ Denunciar</b><small>Denunciando <span id="reportTargetName">usuário</span></small></div>
+      <button id="reportClose" class="icon-btn" type="button" aria-label="Fechar">×</button>
+    </div>
+    <label for="reportReasonSelect">Motivo</label>
+    <select id="reportReasonSelect">
+      <option value="">Selecione um motivo</option>
+      <option value="spam">Spam ou propaganda</option>
+      <option value="assedio">Assédio ou bullying</option>
+      <option value="conteudo_impróprio">Conteúdo impróprio</option>
+      <option value="golpe">Golpe ou fraude</option>
+      <option value="outro">Outro</option>
+    </select>
+    <label for="reportDetailsInput">Detalhes (opcional)</label>
+    <textarea id="reportDetailsInput" maxlength="1000" placeholder="Conte mais sobre o que aconteceu..."></textarea>
+    <div class="servers-inline-actions"><button id="reportCancelBtn" class="text-btn" type="button">Cancelar</button><button id="reportSubmitBtn" class="primary-btn small-btn" type="button">Enviar denúncia</button></div>
+  </div>
+</div>
+<div id="randomCallPanel" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="randomCallTitle">
+  <div class="modal-card random-call-card">
+    <div class="settings-head">
+      <div><b id="randomCallTitle">🎲 Conhecer alguém</b><small>Encontre outra pessoa disponível para uma conversa rápida.</small></div>
+      <button id="randomCallClose" class="icon-btn" type="button" aria-label="Fechar">×</button>
+    </div>
+    <div id="randomCallState" class="random-call-state">
+      <div class="random-pulse">✦</div><h3>Pronto para conhecer alguém?</h3>
+      <p>Você entra em uma fila e será conectado a outra pessoa disponível. Você pode sair a qualquer momento.</p>
+      <button id="randomCallStartBtn" class="primary-btn" type="button">🎲 Encontrar alguém</button>
+    </div>
+    <div id="randomCallMatch" class="hidden random-call-match">
+      <div class="random-match-avatar" id="randomMatchAvatar">?</div>
+      <h3 id="randomMatchName">Conexão encontrada</h3>
+      <span id="randomMatchCode" class="muted"></span>
+      <div class="random-match-actions"><button id="randomCallJoinBtn" class="primary-btn" type="button">📞 Entrar na call</button><button id="randomCallNextBtn" class="secondary-btn" type="button">🎲 Próxima pessoa</button></div>
+      <button id="randomCallBlockBtn" class="text-btn" type="button">🚫 Bloquear e sair</button>
+    </div>
+    <div id="randomCallWaiting" class="hidden random-call-waiting"><div class="random-pulse small">⌛</div><b>Procurando alguém...</b><span>Você pode cancelar quando quiser.</span><button id="randomCallCancelBtn" class="secondary-btn" type="button">Cancelar</button></div>
+    <div id="randomCallEnablePrompt" class="hidden random-call-enable-prompt">
+      <p>Pra usar o "Conhecer alguém" você precisa permitir isso na sua privacidade.</p>
+      <button id="randomCallEnableBtn" class="primary-btn small-btn" type="button">Ativar agora e tentar de novo</button>
+    </div>
+    <div id="randomCallStatus" class="status"></div>
+  </div>
+</div>
+
+<div id="postComposerModal" class="modal hidden" role="dialog" aria-modal="true">
+ <div class="modal-card post-composer-card">
+  <div class="post-composer-head"><b>Nova publicação</b><button id="postComposerClose" class="icon-btn" type="button" aria-label="Fechar">×</button></div>
+  <form id="postForm" class="post-composer">
+   <textarea id="postBody" maxlength="1000" rows="3" placeholder="O que você quer compartilhar?"></textarea>
+   <input id="postMedia" type="file" accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime" hidden>
+   <div id="postMediaPreview" class="post-media-preview hidden"></div>
+   <div class="post-compose-foot"><div class="post-compose-tools"><small id="postCount">0/1000</small><button id="postMediaBtn" class="secondary-btn small-btn" type="button">📷 Foto/vídeo</button></div><button class="primary-btn" type="submit">Publicar</button></div>
+  </form>
+ </div>
+</div>
+
+<div id="messagesPanel" class="modal hidden" role="dialog" aria-modal="true">
+<div class="modal-card messages-card">
+<div id="messagesInboxView" class="dm-inbox-view">
+  <div class="messages-head"><div class="messages-person"><div class="dm-inbox-logo">💬</div><div><strong>Mensagens</strong><small>Suas conversas diretas</small></div></div><button type="button" id="messagesCloseInbox" class="icon-btn" aria-label="Fechar">×</button></div>
+  <div class="messages-toolbar"><input id="messagesInboxSearch" class="friends-search" placeholder="🔎 Procurar conversa..." autocomplete="off"></div>
+  <div id="messagesConversations" class="dm-conversations"><div class="muted">Carregando conversas...</div></div>
+</div>
+<div id="messagesChatView" class="dm-chat-view hidden">
+<div class="messages-head"><button type="button" id="messagesBack" class="icon-btn" aria-label="Voltar para mensagens">‹</button><div class="messages-person"><div id="messagesFriendAvatar" class="dm-avatar">?</div><div><strong id="messagesFriendName">Selecione um amigo</strong><small id="messagesFriendState">Conversa privada</small></div></div><button type="button" id="messagesClose" class="icon-btn" aria-label="Fechar">×</button></div>
+<div class="messages-toolbar"><input id="messagesSearch" class="friends-search" placeholder="🔎 Buscar mensagens" autocomplete="off"></div><div id="messagesList" class="messages-list"><div class="muted">Escolha um amigo para começar.</div></div>
+<form id="messageForm" class="message-form">
+  <button id="messageAttach" class="dm-tool" type="button" title="Foto ou vídeo">＋</button>
+  <input id="messageFile" type="file" accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime" hidden>
+  <input id="messageInput" maxlength="4000" autocomplete="off" placeholder="Escreva uma mensagem...">
+  <button class="dm-send" type="submit" aria-label="Enviar">➤</button>
+  <div id="messageFileInfo" class="dm-file-preview hidden"></div>
+</form>
+<div id="messageStatus" class="status"></div>
+</div></div></div>
+<div id="fcDialog" class="fc-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="fcDialogTitle" aria-describedby="fcDialogMessage">
+  <div class="fc-dialog-card" tabindex="-1">
+    <div class="fc-dialog-head">
+      <div class="fc-dialog-brand"><span class="fc-dialog-logo">F</span><div><b>freechat</b><small id="fcDialogKicker">Confirmação</small></div></div>
+      <button id="fcDialogClose" class="icon-btn fc-dialog-close" type="button" aria-label="Fechar">×</button>
+    </div>
+    <div class="fc-dialog-content">
+      <div id="fcDialogIcon" class="fc-dialog-icon">!</div>
+      <div class="fc-dialog-copy"><h2 id="fcDialogTitle">Confirmar ação</h2><p id="fcDialogMessage"></p></div>
+    </div>
+    <div id="fcDialogInputWrap" class="fc-dialog-input-wrap hidden"><label id="fcDialogInputLabel" for="fcDialogInput">Valor</label><input id="fcDialogInput" type="text" autocomplete="off"></div>
+    <div class="fc-dialog-actions"><button id="fcDialogCancel" class="secondary-btn fc-dialog-btn" type="button">Cancelar</button><button id="fcDialogConfirm" class="primary-btn fc-dialog-btn fc-dialog-danger" type="button">Confirmar</button></div>
+  </div>
+</div>
+<script src="config.js?v=1.6.16"></script><script src="app.js?v=1.6.16"></script>
+</body></html>
