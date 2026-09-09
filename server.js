@@ -155,6 +155,8 @@ async function initDb(){
  await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_duration REAL");
  await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_data BYTEA");
  await pool.query("CREATE INDEX IF NOT EXISTS direct_messages_pair_idx ON direct_messages(sender_id,receiver_id,created_at DESC)");
+ await pool.query("CREATE INDEX IF NOT EXISTS direct_messages_receiver_idx ON direct_messages(receiver_id,sender_id,created_at DESC)");
+ await pool.query("CREATE INDEX IF NOT EXISTS direct_messages_unread_idx ON direct_messages(receiver_id,sender_id) WHERE read_at IS NULL");
  await pool.query(`CREATE TABLE IF NOT EXISTS direct_chat_pins(
    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    other_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
