@@ -6,13 +6,12 @@ function allowOrigin(origin){
   if(!origin)return true;
   if(configuredOrigins.length===0||configuredOrigins.includes("*")||configuredOrigins.includes(origin))return true;
   if(origin==="https://freechat-ten.vercel.app")return true;
-   if(origin==="https://freechatsocial.com"||origin==="https://www.freechatsocial.com")return true;
   if(/^https:\/\/[a-z0-9-]+(?:-[a-z0-9-]+)*\.vercel\.app$/i.test(origin))return true;
   if(/^https:\/\/[a-z0-9-]+(?:-[a-z0-9-]+)*\.netlify\.app$/i.test(origin))return true;
   if(/^http:\/\/(localhost|127\.0\.0\.1)(?::\d+)?$/i.test(origin))return true;
   return false;
 }
-const corsOptions={origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST","PATCH","PUT","DELETE","OPTIONS"],credentials:false};
+const corsOptions={origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST","OPTIONS"],credentials:false};
 app.use(cors(corsOptions));
 app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.setHeader("X-Frame-Options","DENY");res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");res.setHeader("Permissions-Policy","camera=(self), microphone=(self), display-capture=(self)");res.setHeader("Cross-Origin-Opener-Policy","same-origin");res.setHeader("Cross-Origin-Resource-Policy","cross-origin");res.setHeader("Content-Security-Policy","default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https: wss:; script-src 'self' https://cdn.socket.io; style-src 'self' 'unsafe-inline'; font-src 'self' data: https:; form-action 'self'");if(req.secure||req.headers["x-forwarded-proto"]==="https")res.setHeader("Strict-Transport-Security","max-age=31536000; includeSubDomains");next()});
 app.use(express.json({limit:"32kb"}));
@@ -21,13 +20,7 @@ const server=http.createServer(app);
 server.keepAliveTimeout=120000;
 server.headersTimeout=125000;
 const io=new Server(server,{path:"/socket.io",addTrailingSlash:false,cors:{origin:(origin,cb)=>cb(null,allowOrigin(origin)),methods:["GET","POST"],credentials:false},transports:["polling","websocket"],allowEIO3:true,connectTimeout:10000});
-const pool=new Pool({
-  connectionString:process.env.DATABASE_URL,
-  ssl:process.env.DATABASE_URL?{rejectUnauthorized:false}:false,
-  connectionTimeoutMillis:10000,
-  idleTimeoutMillis:30000,
-  max:10
-});
+const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL?{rejectUnauthorized:false}:false});
 pool.on("error",e=>console.error("PostgreSQL pool error:",e?.message||e));
 let dbReady=false;
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024},fileFilter:(req,file,cb)=>{const mime=/^(image\/(jpeg|png|webp|gif)|video\/(mp4|webm|quicktime|ogg))$/i.test(file.mimetype);const name=String(file.originalname||"").normalize("NFKC");const ext=(name.match(/\.([A-Za-z0-9]{1,8})$/)||[])[1]?.toLowerCase();const allowed=(file.mimetype.startsWith("image/")?{jpeg:"image/jpeg",jpg:"image/jpeg",png:"image/png",webp:"image/webp",gif:"image/gif"}:{mp4:"video/mp4",webm:"video/webm",mov:"video/quicktime",ogg:"video/ogg",oga:"video/ogg"});const ok=!!ext&&mime&&allowed[ext]===file.mimetype.toLowerCase()&&!/\.(php|phtml|js|html|svg|exe|bat|cmd|sh)(\.|$)/i.test(name);cb(ok?null:new Error("Arquivo não permitido. Use uma imagem JPG/PNG/WEBP/GIF ou vídeo MP4/WebM/MOV/OGG."),ok)}});
@@ -45,7 +38,7 @@ function notifyUser(code,event,payload){
 async function addNotification(userId,type,title,body,data={}){
  try{const x=await pool.query("INSERT INTO notifications(user_id,type,title,body,data) VALUES($1,$2,$3,$4,$5) RETURNING id,type,title,body,data,created_at",[userId,type,title,String(body||"").slice(0,500),JSON.stringify(data||{})]);notifyUser((await getUserById(userId))?.code,"notification-new",x.rows[0]);return x.rows[0]}catch(e){console.error("notification",e);return null}
 }
-async function getUserById(id){const x=await pool.query("SELECT id,name,email,code,avatar_mime,avatar_updated_at FROM users WHERE id=$1 LIMIT 1",[id]);return x.rows[0]||null}
+async function getUserById(id){const x=await pool.query("SELECT id,name,email,code FROM users WHERE id=$1 LIMIT 1",[id]);return x.rows[0]||null}
 const SESSION_TTL_MS=7*24*60*60*1000;
 function rateLimit(key,limit,windowMs){
   const now=Date.now(), old=rateLimits.get(key)||[];
@@ -63,21 +56,8 @@ function guard(req,res,next){
 async function initDb(){
  await pool.query(`CREATE TABLE IF NOT EXISTS users(
  id BIGSERIAL PRIMARY KEY,name VARCHAR(24) NOT NULL,email VARCHAR(120) UNIQUE NOT NULL,code VARCHAR(9) UNIQUE NOT NULL,
- salt TEXT NOT NULL,password_hash TEXT NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW(),email_verified_at TIMESTAMPTZ
+ salt TEXT NOT NULL,password_hash TEXT NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW()
  )`);
- await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ");
- await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ");
- await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason VARCHAR(300)"); await pool.query("UPDATE users SET email_verified_at=COALESCE(email_verified_at,created_at) WHERE email_verified_at IS NULL");
- await pool.query(`CREATE TABLE IF NOT EXISTS email_tokens(
-   id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   token_hash TEXT NOT NULL,type VARCHAR(24) NOT NULL,expires_at TIMESTAMPTZ NOT NULL,
-   used_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
- )`);
- await pool.query("CREATE INDEX IF NOT EXISTS email_tokens_lookup_idx ON email_tokens(token_hash,type,expires_at)");
- await pool.query("CREATE INDEX IF NOT EXISTS email_tokens_user_idx ON email_tokens(user_id,type,created_at DESC)");
- await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_mime VARCHAR(64)`);
- await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data BYTEA`);
- await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_updated_at TIMESTAMPTZ`);
  await pool.query(`CREATE TABLE IF NOT EXISTS friend_requests(
  id BIGSERIAL PRIMARY KEY,sender_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  receiver_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,status VARCHAR(12) NOT NULL DEFAULT 'pending',
@@ -105,29 +85,6 @@ async function initDb(){
    post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(post_id,user_id)
  )`);
- await pool.query(`CREATE TABLE IF NOT EXISTS social_comments(
-   id BIGSERIAL PRIMARY KEY,
-   post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
-   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   body VARCHAR(800) NOT NULL,
-   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
- )`);
- await pool.query("CREATE INDEX IF NOT EXISTS social_comments_post_idx ON social_comments(post_id,created_at ASC)");
- await pool.query(`CREATE TABLE IF NOT EXISTS social_saves(
-   post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
-   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-   PRIMARY KEY(post_id,user_id)
- )`);
- await pool.query("CREATE INDEX IF NOT EXISTS social_posts_created_idx ON social_posts(created_at DESC,id DESC)");
- await pool.query(`CREATE TABLE IF NOT EXISTS feed_events(
-   id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
-   event_type VARCHAR(24) NOT NULL, dwell_ms INTEGER NOT NULL DEFAULT 0,
-   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
- )`);
- await pool.query("CREATE INDEX IF NOT EXISTS feed_events_user_idx ON feed_events(user_id,created_at DESC)");
- await pool.query("CREATE INDEX IF NOT EXISTS feed_events_post_idx ON feed_events(post_id,event_type,created_at DESC)");
  await pool.query(`CREATE TABLE IF NOT EXISTS notifications(
    id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    type VARCHAR(32) NOT NULL, title VARCHAR(120) NOT NULL, body VARCHAR(500), data JSONB, read_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -155,14 +112,6 @@ async function initDb(){
  await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_duration REAL");
  await pool.query("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS media_data BYTEA");
  await pool.query("CREATE INDEX IF NOT EXISTS direct_messages_pair_idx ON direct_messages(sender_id,receiver_id,created_at DESC)");
- await pool.query("CREATE INDEX IF NOT EXISTS direct_messages_receiver_idx ON direct_messages(receiver_id,sender_id,created_at DESC)");
- await pool.query("CREATE INDEX IF NOT EXISTS direct_messages_unread_idx ON direct_messages(receiver_id,sender_id) WHERE read_at IS NULL");
- await pool.query(`CREATE TABLE IF NOT EXISTS direct_chat_pins(
-   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   other_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-   PRIMARY KEY(user_id,other_id)
- )`);
  await pool.query(`CREATE TABLE IF NOT EXISTS app_sessions(
    token TEXT PRIMARY KEY,
    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -180,60 +129,6 @@ async function initDb(){
  await pool.query(`CREATE TABLE IF NOT EXISTS blocked_users(user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,blocked_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(user_id,blocked_id))`);
  await pool.query(`CREATE TABLE IF NOT EXISTS reports(id BIGSERIAL PRIMARY KEY,reporter_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,target_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,reason VARCHAR(64) NOT NULL,details VARCHAR(1000),status VARCHAR(16) NOT NULL DEFAULT 'open',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
  await pool.query(`CREATE TABLE IF NOT EXISTS user_privacy(user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,message_policy VARCHAR(16) NOT NULL DEFAULT 'friends',call_policy VARCHAR(16) NOT NULL DEFAULT 'friends',friend_policy VARCHAR(16) NOT NULL DEFAULT 'everyone')`);
- await pool.query(`CREATE TABLE IF NOT EXISTS user_follows(follower_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,following_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(follower_id,following_id))`);
- await pool.query(`CREATE INDEX IF NOT EXISTS user_follows_follower_idx ON user_follows(follower_id,created_at DESC)`);
- await pool.query(`CREATE INDEX IF NOT EXISTS user_follows_following_idx ON user_follows(following_id,created_at DESC)`);
- await pool.query(`ALTER TABLE user_privacy ADD COLUMN IF NOT EXISTS random_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
- await pool.query(`CREATE TABLE IF NOT EXISTS random_queue(
-   user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-   joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-   last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
- )`);
- await pool.query("ALTER TABLE random_queue ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()");
- await pool.query(`CREATE INDEX IF NOT EXISTS random_queue_joined_idx ON random_queue(joined_at)`);
- await pool.query(`CREATE INDEX IF NOT EXISTS random_queue_seen_idx ON random_queue(last_seen_at)`);
- await pool.query(`CREATE TABLE IF NOT EXISTS random_matches(
-   match_id VARCHAR(32) PRIMARY KEY,
-   user_a BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   user_b BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   room VARCHAR(64) NOT NULL,
-   status VARCHAR(16) NOT NULL DEFAULT 'active',
-   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-   expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW()+INTERVAL '10 minutes')
- )`);
- await pool.query("CREATE INDEX IF NOT EXISTS random_matches_user_idx ON random_matches(user_a,user_b,status,created_at DESC)");
- await pool.query("CREATE INDEX IF NOT EXISTS random_matches_exp_idx ON random_matches(status,expires_at)");
-
- await pool.query(`CREATE TABLE IF NOT EXISTS communities(
-   id BIGSERIAL PRIMARY KEY,
-   owner_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   name VARCHAR(48) NOT NULL,
-   description VARCHAR(180) NOT NULL DEFAULT '',
-   is_public BOOLEAN NOT NULL DEFAULT TRUE,
-   invite_code VARCHAR(16) UNIQUE NOT NULL,
-   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
- )`);
- await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS icon VARCHAR(8) NOT NULL DEFAULT '🌐'");
- await pool.query(`CREATE TABLE IF NOT EXISTS community_members(
-   community_id BIGINT NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
-   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   role VARCHAR(16) NOT NULL DEFAULT 'member',
-   joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-   PRIMARY KEY(community_id,user_id)
- )`);
- await pool.query(`CREATE TABLE IF NOT EXISTS community_channels(
-   id BIGSERIAL PRIMARY KEY,
-   community_id BIGINT NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
-   name VARCHAR(48) NOT NULL,
-   type VARCHAR(8) NOT NULL DEFAULT 'text',
-   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
- )`);
- await pool.query("CREATE INDEX IF NOT EXISTS community_members_user_idx ON community_members(user_id)");
- await pool.query("CREATE INDEX IF NOT EXISTS community_channels_community_idx ON community_channels(community_id,id)");
- await pool.query("CREATE INDEX IF NOT EXISTS communities_public_idx ON communities(is_public,created_at DESC)");
- await pool.query("CREATE INDEX IF NOT EXISTS community_members_community_idx ON community_members(community_id,joined_at DESC)");
- await pool.query("ALTER TABLE communities ALTER COLUMN is_public SET DEFAULT TRUE");
-
 }
 
 function cleanName(value){
@@ -242,67 +137,6 @@ function cleanName(value){
 function cleanEmail(value){
   return String(value ?? "").trim().toLowerCase().slice(0,120);
 }
-
-function htmlEscape(value){
-  return String(value??"").replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[ch]));
-}
-const EMAIL_TOKEN_TTL_MS=30*60*1000;
-const VERIFY_TOKEN_TTL_MS=24*60*60*1000;
-function emailConfigured(){
-  return !!(String(process.env.RESEND_API_KEY||"").trim() && String(process.env.RESEND_FROM||"").trim());
-}
-function publicAppUrl(){
-  return String(process.env.APP_URL||"https://freechatsocial.com").trim().replace(/\/+$/,"");
-}
-async function sendResendEmail({to,subject,html,text,idempotencyKey}){
-  const key=String(process.env.RESEND_API_KEY||"").trim();
-  const from=String(process.env.RESEND_FROM||"").trim();
-  if(!key||!from){
-    const e=new Error("O envio de e-mail ainda não está configurado no servidor.");
-    e.code="EMAIL_NOT_CONFIGURED"; throw e;
-  }
-  const payload={from,to:[to],subject,html,text};
-  const headers={"Content-Type":"application/json","Authorization":"Bearer "+key};
-  if(idempotencyKey)headers["Idempotency-Key"]=String(idempotencyKey).slice(0,256);
-  const response=await fetch("https://api.resend.com/emails",{method:"POST",headers,body:JSON.stringify(payload)});
-  const data=await response.json().catch(()=>({}));
-  if(!response.ok){
-    const detail=String(data?.message||data?.error||"Erro do Resend").slice(0,300);
-    const e=new Error(detail);e.code="RESEND_ERROR";e.status=response.status;throw e;
-  }
-  return data;
-}
-function makeEmailToken(){return crypto.randomBytes(32).toString("base64url");}
-function hashEmailToken(token){return crypto.createHash("sha256").update(String(token)).digest("hex");}
-async function createEmailToken(userId,type,ttlMs){
-  const token=makeEmailToken(),hash=hashEmailToken(token),expires=new Date(Date.now()+ttlMs);
-  await pool.query("DELETE FROM email_tokens WHERE user_id=$1 AND type=$2 AND used_at IS NULL",[userId,type]);
-  await pool.query("INSERT INTO email_tokens(user_id,token_hash,type,expires_at) VALUES($1,$2,$3,$4)",[userId,hash,type,expires]);
-  return token;
-}
-async function getEmailToken(token,type){
-  const x=await pool.query("SELECT id,user_id,expires_at,used_at FROM email_tokens WHERE token_hash=$1 AND type=$2 LIMIT 1",[hashEmailToken(token),type]);
-  const row=x.rows[0];
-  if(!row||row.used_at||new Date(row.expires_at).getTime()<Date.now())return null;
-  return row;
-}
-function verificationEmail(u,token){
-  const link=publicAppUrl()+"/?verify="+encodeURIComponent(token),name=htmlEscape(u.name);
-  return {
-    subject:"Verifique seu e-mail — FreeChat",
-    html:`<!doctype html><html><body style="font-family:Arial,sans-serif;background:#0b1020;color:#e8eef8;padding:32px"><div style="max-width:560px;margin:auto;background:#151c2f;border-radius:18px;padding:28px"><h1 style="margin-top:0">Bem-vindo ao FreeChat, ${name}!</h1><p>Confirme seu endereço de e-mail para ativar sua conta.</p><p><a href="${htmlEscape(link)}" style="display:inline-block;padding:12px 18px;background:#6d5dfc;color:#fff;text-decoration:none;border-radius:10px;font-weight:bold">Verificar e-mail</a></p><p style="color:#9aa8bd;font-size:13px">Este link expira em 24 horas.</p><p style="color:#9aa8bd;font-size:12px">Se você não criou esta conta, ignore esta mensagem.</p></div></body></html>`,
-    text:`Bem-vindo ao FreeChat, ${u.name}! Verifique seu e-mail: ${link}\n\nO link expira em 24 horas.`
-  };
-}
-function passwordResetEmail(u,token){
-  const link=publicAppUrl()+"/?reset="+encodeURIComponent(token),name=htmlEscape(u.name);
-  return {
-    subject:"Redefinição de senha — FreeChat",
-    html:`<!doctype html><html><body style="font-family:Arial,sans-serif;background:#0b1020;color:#e8eef8;padding:32px"><div style="max-width:560px;margin:auto;background:#151c2f;border-radius:18px;padding:28px"><h1 style="margin-top:0">Redefinir sua senha</h1><p>Olá, ${name}. Recebemos uma solicitação para redefinir a senha da sua conta.</p><p><a href="${htmlEscape(link)}" style="display:inline-block;padding:12px 18px;background:#6d5dfc;color:#fff;text-decoration:none;border-radius:10px;font-weight:bold">Redefinir senha</a></p><p style="color:#9aa8bd;font-size:13px">Este link expira em 30 minutos e pode ser usado uma única vez.</p><p style="color:#9aa8bd;font-size:12px">Se você não fez esta solicitação, ignore esta mensagem.</p></div></body></html>`,
-    text:`Olá, ${u.name}. Redefina sua senha aqui: ${link}\n\nO link expira em 30 minutos e pode ser usado uma única vez.`
-  };
-}
-
 function code(){
   const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let out="CL-";
@@ -330,25 +164,20 @@ function clearFailedLogin(key){failedLogins.delete(key);}
 async function securityEvent(userId,type,meta={}){try{await pool.query("INSERT INTO security_events(user_id,event_type,ip_hash,user_agent,meta) VALUES($1,$2,$3,$4,$5)",[userId||null,type,meta.ip?crypto.createHash("sha256").update(String(process.env.SESSION_SECRET||"freechat")+String(meta.ip)).digest("hex"):null,String(meta.ua||"").slice(0,300),JSON.stringify(meta.data||{})])}catch(e){console.error("security-event",e)}}
 async function getUserByEmail(email){
   const x=await pool.query(
-    "SELECT id,name,email,code,salt,password_hash,created_at,email_verified_at,avatar_mime,avatar_updated_at FROM users WHERE email=$1 LIMIT 1",
+    "SELECT id,name,email,code,salt,password_hash,created_at FROM users WHERE email=$1 LIMIT 1",
     [cleanEmail(email)]
   );
   return x.rows[0]||null;
 }
 async function getUserByCode(value){
   const x=await pool.query(
-    "SELECT id,name,email,code,salt,password_hash,created_at,email_verified_at,avatar_mime,avatar_updated_at FROM users WHERE code=$1 LIMIT 1",
+    "SELECT id,name,email,code,salt,password_hash,created_at FROM users WHERE code=$1 LIMIT 1",
     [String(value??"").trim().toUpperCase()]
   );
   return x.rows[0]||null;
 }
-function avatarUrlFor(u){
-  if(!u?.avatar_mime)return null;
-  const v=u.avatar_updated_at?new Date(u.avatar_updated_at).getTime():0;
-  return "/api/avatar/"+u.code+"?v="+v;
-}
 function pub(u){
-  return {id:u.id,name:u.name,email:u.email,code:u.code,emailVerified:!!u.email_verified_at,avatarUrl:avatarUrlFor(u)};
+  return {id:u.id,name:u.name,email:u.email,code:u.code};
 }
 async function token(u,meta={}){
   const t=crypto.randomBytes(32).toString("base64url");
@@ -375,7 +204,6 @@ async function getSession(t){
   return sess;
 }
 async function auth(req,res){
-  if(!dbReady){res.status(503).json({error:"O servidor ainda está inicializando o banco de dados. Tente novamente em alguns segundos.",code:"DATABASE_NOT_READY"});return null;}
   const raw=String(req.headers.authorization||"");
   const t=raw.startsWith("Bearer ")?raw.slice(7).trim():"";
   const sess=await getSession(t);
@@ -391,331 +219,16 @@ async function auth(req,res){
     res.status(401).json({error:"Sessão inválida."});
     return null;
   }
-  if(u.banned_at){
-    sessions.delete(t);
-    await pool.query("DELETE FROM app_sessions WHERE token=$1",[sessionHash(t)]);
-    res.status(403).json({error:"Sua conta foi suspensa."+(u.ban_reason?" Motivo: "+u.ban_reason:"")});
-    return null;
-  }
   sess.expires=Date.now()+SESSION_TTL_MS;
   await pool.query("UPDATE app_sessions SET expires_at=to_timestamp($2/1000.0),email=$3,last_seen_at=NOW() WHERE token=$1",[sessionHash(t),sess.expires,u.email]);
   return u;
 }
 
-
-function cleanCommunityName(v){return String(v??"").replace(/\s+/g," ").trim().slice(0,48)}
-
-/* ===== Painel de administração — acesso restrito por e-mail ===== */
-const ADMIN_EMAILS=["fre3chat@gmail.com"];
-function isAdminUser(u){return !!u&&ADMIN_EMAILS.includes(String(u.email||"").toLowerCase());}
-async function requireAdmin(req,res){
-  const u=await auth(req,res);
-  if(!u)return null; // auth() já respondeu 401
-  if(!isAdminUser(u)){res.status(403).json({error:"Acesso restrito ao administrador."});return null;}
-  return u;
-}
-function cleanCommunityDesc(v){return String(v??"").replace(/\s+/g," ").trim().slice(0,180)}
-function cleanChannelName(v){return String(v??"").replace(/\s+/g," ").trim().slice(0,32)}
-function communityCode(){const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";let out="FR-";for(let i=0;i<8;i++)out+=chars[crypto.randomInt(chars.length)];return out}
-async function isCommunityMember(userId,communityId){
- const uid=Number(userId),cid=Number(communityId);
- if(!Number.isSafeInteger(uid)||!Number.isSafeInteger(cid)||uid<1||cid<1)return null;
- const x=await pool.query("SELECT role FROM community_members WHERE community_id=$1 AND user_id=$2 LIMIT 1",[cid,uid]);
- return x.rows[0]||null;
-}
-async function communitySummary(row,userId){
- return {id:Number(row.id),name:row.name,description:row.description||"",is_public:!!row.is_public,invite_code:Number(row.owner_id)===Number(userId)?row.invite_code:null,owner_id:Number(row.owner_id),member_count:Number(row.member_count||0),joined:!!row.joined,role:row.role||null,created_at:row.created_at};
-}
-app.get("/api/servers",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;
- const search=String(q.query?.q||"").replace(/\s+/g," ").trim().slice(0,60);
- const like=`%${search}%`;
- const mine=await pool.query(`SELECT c.*,COUNT(cm2.user_id)::int AS member_count,TRUE AS joined,
-   (SELECT role FROM community_members cm3 WHERE cm3.community_id=c.id AND cm3.user_id=$1 LIMIT 1) AS role
-   FROM communities c LEFT JOIN community_members cm2 ON cm2.community_id=c.id
-   WHERE EXISTS(SELECT 1 FROM community_members cm4 WHERE cm4.community_id=c.id AND cm4.user_id=$1)
-     AND ($2='' OR c.name ILIKE $3 OR c.description ILIKE $3)
-   GROUP BY c.id ORDER BY c.created_at DESC LIMIT 100`,[u.id,search,like]);
- const discover=await pool.query(`SELECT c.*,COUNT(cm2.user_id)::int AS member_count,FALSE AS joined,NULL::text AS role
-   FROM communities c LEFT JOIN community_members cm2 ON cm2.community_id=c.id
-   WHERE c.is_public=TRUE AND NOT EXISTS(SELECT 1 FROM community_members cm WHERE cm.community_id=c.id AND cm.user_id=$1)
-     AND ($2='' OR c.name ILIKE $3 OR c.description ILIKE $3)
-   GROUP BY c.id ORDER BY member_count DESC,c.created_at DESC LIMIT 100`,[u.id,search,like]);
- r.json({mine:mine.rows.map(x=>communitySummary(x,u.id)),discover:discover.rows.map(x=>communitySummary(x,u.id)),query:search});
-}catch(e){console.error("servers-list",e);r.status(500).json({error:"Não foi possível carregar os servidores."})}});
-
-app.post("/api/servers",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;
- if(!rateLimit("server-create:"+u.id,5,10*60*1000))return r.status(429).json({error:"Você criou muitos servidores recentemente. Aguarde alguns minutos."});
- const name=cleanCommunityName(q.body?.name),description=cleanCommunityDesc(q.body?.description);
- const rawVisibility=q.body?.isPublic;
- const isPublic=!(rawVisibility===false||String(rawVisibility||"").trim().toLowerCase()==="false"||String(q.body?.visibility||"").trim().toLowerCase()==="private");
- if(name.length<2)return r.status(400).json({error:"O nome do servidor precisa ter pelo menos 2 caracteres."});
- const count=await pool.query("SELECT COUNT(*)::int AS n FROM community_members WHERE user_id=$1 AND role='owner'",[u.id]);
- if(Number(count.rows[0]?.n||0)>=20)return r.status(400).json({error:"Você atingiu o limite de 20 servidores criados."});
- let created=null;
- for(let i=0;i<8&&!created;i++){const invite=communityCode();try{
-   const client=await pool.connect();
-   try{await client.query("BEGIN");const x=await client.query("INSERT INTO communities(owner_id,name,description,is_public,invite_code) VALUES($1,$2,$3,$4,$5) RETURNING *",[u.id,name,description,isPublic,invite]);created=x.rows[0];
-     await client.query("INSERT INTO community_members(community_id,user_id,role) VALUES($1,$2,'owner')",[created.id,u.id]);
-     await client.query("INSERT INTO community_channels(community_id,name,type) VALUES($1,'geral','text'),($1,'Sala de voz','voice')",[created.id]);await client.query("COMMIT");
-   }catch(e){try{await client.query("ROLLBACK")}catch(_){} if(e?.code!=="23505")throw e}finally{client.release()}
- }catch(e){if(e?.code!=="23505")throw e;}}
- if(!created)return r.status(500).json({error:"Não foi possível gerar um convite único. Tente novamente."});
- await securityEvent(u.id,"COMMUNITY_CREATED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{communityId:created.id}});
- r.status(201).json({server:{id:Number(created.id),name:String(created.name||name),description:String(created.description||description),is_public:created.is_public!==false,invite_code:created.invite_code}});
-}catch(e){console.error("server-create",e);r.status(500).json({error:"Não foi possível criar o servidor."})}});
-
-app.post("/api/servers/join",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;
- const invite=String(q.body?.inviteCode||"").trim().toUpperCase().replace(/\s+/g,"").slice(0,16);
- if(!/^FR-[A-Z0-9]{8}$/.test(invite))return r.status(400).json({error:"Código de convite inválido. Use FR-XXXXXXXX."});
- const x=await pool.query("SELECT id,name,is_public FROM communities WHERE invite_code=$1 LIMIT 1",[invite]);if(!x.rowCount)return r.status(404).json({error:"Servidor não encontrado ou convite expirado."});
- await pool.query("INSERT INTO community_members(community_id,user_id,role) VALUES($1,$2,'member') ON CONFLICT(community_id,user_id) DO NOTHING",[x.rows[0].id,u.id]);
- r.json({ok:true,server:{id:Number(x.rows[0].id),name:x.rows[0].name}});
-}catch(e){console.error("server-join",e);r.status(500).json({error:"Não foi possível entrar no servidor."})}});
-
-app.post("/api/servers/:id/join",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;
- const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Servidor inválido."});
- const x=await pool.query("SELECT id,name,is_public FROM communities WHERE id=$1 LIMIT 1",[id]);if(!x.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
- if(!x.rows[0].is_public)return r.status(403).json({error:"Este servidor é privado. Use um código de convite."});
- await pool.query("INSERT INTO community_members(community_id,user_id,role) VALUES($1,$2,'member') ON CONFLICT(community_id,user_id) DO NOTHING",[id,u.id]);
- r.json({ok:true,server:{id:Number(x.rows[0].id),name:x.rows[0].name}});
-}catch(e){console.error("server-join-id",e);r.status(500).json({error:"Não foi possível entrar no servidor."})}});
-
-app.post("/api/servers/:id/leave",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Servidor inválido."});
- const owner=await pool.query("SELECT owner_id FROM communities WHERE id=$1 LIMIT 1",[id]);if(!owner.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
- if(Number(owner.rows[0].owner_id)===Number(u.id))return r.status(400).json({error:"O proprietário não pode sair. Transfira a propriedade antes."});
- const x=await pool.query("DELETE FROM community_members WHERE community_id=$1 AND user_id=$2 RETURNING community_id",[id,u.id]);
- if(!x.rowCount)return r.status(400).json({error:"Você não participa deste servidor."});r.json({ok:true});
-}catch(e){console.error("server-leave",e);r.status(500).json({error:"Não foi possível sair do servidor."})}});
-
-app.get("/api/servers/:id",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Servidor inválido."});
- const member=await isCommunityMember(u.id,id);if(!member)return r.status(403).json({error:"Você não participa deste servidor."});
- const s=await pool.query("SELECT id,owner_id,name,description,is_public,invite_code,created_at FROM communities WHERE id=$1 LIMIT 1",[id]);if(!s.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
- const ch=await pool.query("SELECT id,name,type FROM community_channels WHERE community_id=$1 ORDER BY CASE WHEN type='text' THEN 0 ELSE 1 END,id",[id]);
- const mc=await pool.query("SELECT COUNT(*)::int AS n FROM community_members WHERE community_id=$1",[id]);
- const members=await pool.query(`SELECT u.id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,cm.role,cm.joined_at
-   FROM community_members cm JOIN users u ON u.id=cm.user_id WHERE cm.community_id=$1 ORDER BY CASE cm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,cm.joined_at ASC LIMIT 100`,[id]);
- const channels=ch.rows.map(c=>({id:Number(c.id),name:c.name,type:c.type,room_name:`srv-${id}-${c.id}`}));
- r.json({server:{id:Number(s.rows[0].id),owner_id:Number(s.rows[0].owner_id),name:s.rows[0].name,description:s.rows[0].description||"",is_public:!!s.rows[0].is_public,invite_code:Number(s.rows[0].owner_id)===Number(u.id)?s.rows[0].invite_code:null,role:member.role,member_count:Number(mc.rows[0]?.n||0),created_at:s.rows[0].created_at,channels,members:members.rows.map(m=>({id:Number(m.id),name:m.name,code:m.code,role:m.role,avatarUrl:avatarUrlFor(m)}))}});
-}catch(e){console.error("server-detail",e);r.status(500).json({error:"Não foi possível carregar o servidor."})}});
-
-app.post("/api/servers/:id/channels",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),member=await isCommunityMember(u.id,id);if(!member||!['owner','admin'].includes(member.role))return r.status(403).json({error:"Você não tem permissão para criar canais."});
- const name=cleanChannelName(q.body?.name),type=String(q.body?.type||"text");if(name.length<1||!["text","voice"].includes(type))return r.status(400).json({error:"Canal inválido."});
- const count=await pool.query("SELECT COUNT(*)::int AS n FROM community_channels WHERE community_id=$1",[id]);if(Number(count.rows[0]?.n||0)>=50)return r.status(400).json({error:"Este servidor já atingiu o limite de 50 canais."});
- const dup=await pool.query("SELECT 1 FROM community_channels WHERE community_id=$1 AND lower(name)=lower($2) LIMIT 1",[id,name]);if(dup.rowCount)return r.status(409).json({error:"Já existe um canal com esse nome."});
- const x=await pool.query("INSERT INTO community_channels(community_id,name,type) VALUES($1,$2,$3) RETURNING id,name,type",[id,name,type]);r.status(201).json({channel:{id:Number(x.rows[0].id),name:x.rows[0].name,type:x.rows[0].type,room_name:`srv-${id}-${x.rows[0].id}`} });
-}catch(e){console.error("channel-create",e);r.status(500).json({error:"Não foi possível criar o canal."})}});
-
-app.patch("/api/servers/:id",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),member=await isCommunityMember(u.id,id);if(!member||!['owner','admin'].includes(member.role))return r.status(403).json({error:"Você não tem permissão para editar este servidor."});
- const name=cleanCommunityName(q.body?.name),description=cleanCommunityDesc(q.body?.description);
- const rawVisibility=q.body?.isPublic;
- const isPublic=!(rawVisibility===false||String(rawVisibility||"").trim().toLowerCase()==="false"||String(q.body?.visibility||"").trim().toLowerCase()==="private");if(name.length<2)return r.status(400).json({error:"Nome inválido."});
- await pool.query("UPDATE communities SET name=$1,description=$2,is_public=$3 WHERE id=$4",[name,description,isPublic,id]);r.json({ok:true});
-}catch(e){console.error("server-update",e);r.status(500).json({error:"Não foi possível atualizar o servidor."})}});
-app.patch("/api/servers/:id/members/:memberId",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),memberId=Number(q.params.memberId),me=await isCommunityMember(u.id,id);if(!me||me.role!=="owner")return r.status(403).json({error:"Somente o proprietário pode gerenciar administradores."});
- if(!Number.isSafeInteger(memberId)||memberId<1)return r.status(400).json({error:"Membro inválido."});const role=String(q.body?.role||"member");if(!['admin','member'].includes(role))return r.status(400).json({error:"Cargo inválido."});
- const x=await pool.query("UPDATE community_members SET role=$1 WHERE community_id=$2 AND user_id=$3 AND role<>'owner' RETURNING user_id,role",[role,id,memberId]);if(!x.rowCount)return r.status(404).json({error:"Membro não encontrado ou proprietário."});r.json({ok:true,member:{id:memberId,role}});
-}catch(e){console.error("server-member-role",e);r.status(500).json({error:"Não foi possível atualizar o cargo."})}});
-app.delete("/api/servers/:id/channels/:channelId",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),channelId=Number(q.params.channelId),member=await isCommunityMember(u.id,id);if(!member||!['owner','admin'].includes(member.role))return r.status(403).json({error:"Você não tem permissão para remover canais."});
- const x=await pool.query("SELECT type FROM community_channels WHERE id=$1 AND community_id=$2",[channelId,id]);if(!x.rowCount)return r.status(404).json({error:"Canal não encontrado."});
- if(x.rows[0].type==='text'){const c=await pool.query("SELECT COUNT(*)::int AS n FROM community_channels WHERE community_id=$1 AND type='text'",[id]);if(Number(c.rows[0].n)<=1)return r.status(400).json({error:"O servidor precisa manter pelo menos um canal de texto."});}
- await pool.query("DELETE FROM community_channels WHERE id=$1 AND community_id=$2",[channelId,id]);r.json({ok:true});
-}catch(e){console.error("channel-delete",e);r.status(500).json({error:"Não foi possível remover o canal."})}});
-
-/* ===== Painel de administração (acesso restrito) ===== */
-app.get("/api/admin/check",async(q,r)=>{try{
-  const u=await auth(q,r);if(!u)return;
-  r.json({isAdmin:isAdminUser(u)});
-}catch(e){console.error("admin-check",e);r.status(500).json({error:"Erro."})}});
-
-app.get("/api/admin/stats",async(q,r)=>{try{
-  const admin=await requireAdmin(q,r);if(!admin)return;
-  const [users,verified,bannedN,posts,postsToday,servers,openReports,messages7d,newUsers7d]=await Promise.all([
-    pool.query("SELECT COUNT(*)::int AS n FROM users"),
-    pool.query("SELECT COUNT(*)::int AS n FROM users WHERE email_verified_at IS NOT NULL"),
-    pool.query("SELECT COUNT(*)::int AS n FROM users WHERE banned_at IS NOT NULL"),
-    pool.query("SELECT COUNT(*)::int AS n FROM social_posts"),
-    pool.query("SELECT COUNT(*)::int AS n FROM social_posts WHERE created_at>NOW()-INTERVAL '24 hours'"),
-    pool.query("SELECT COUNT(*)::int AS n FROM communities"),
-    pool.query("SELECT COUNT(*)::int AS n FROM reports WHERE status='open'"),
-    pool.query("SELECT COUNT(*)::int AS n FROM direct_messages WHERE created_at>NOW()-INTERVAL '7 days'"),
-    pool.query("SELECT COUNT(*)::int AS n FROM users WHERE created_at>NOW()-INTERVAL '7 days'"),
-  ]);
-  r.json({
-    totalUsers:users.rows[0].n,verifiedUsers:verified.rows[0].n,bannedUsers:bannedN.rows[0].n,
-    totalPosts:posts.rows[0].n,postsToday:postsToday.rows[0].n,
-    totalServers:servers.rows[0].n,openReports:openReports.rows[0].n,
-    messages7d:messages7d.rows[0].n,newUsers7d:newUsers7d.rows[0].n,
-    activeRooms:rooms.size,activeCalls:calls.size,
-  });
-}catch(e){console.error("admin-stats",e);r.status(500).json({error:"Não foi possível carregar as estatísticas."})}});
-
-app.get("/api/admin/users",async(q,r)=>{try{
-  const admin=await requireAdmin(q,r);if(!admin)return;
-  const search=String(q.query?.q||"").trim().slice(0,60);
-  const limit=Math.min(Math.max(Number(q.query.limit)||30,1),100);
-  const offset=Math.min(Math.max(Number(q.query.offset)||0,0),10000);
-  const like=`%${search}%`;
-  const x=await pool.query(`SELECT id,name,email,code,created_at,email_verified_at,banned_at,ban_reason,
-      (SELECT COUNT(*)::int FROM social_posts WHERE author_id=users.id) AS post_count
-    FROM users
-    WHERE ($1='' OR name ILIKE $2 OR email ILIKE $2 OR code ILIKE $2)
-    ORDER BY created_at DESC LIMIT $3 OFFSET $4`,[search,like,limit,offset]);
-  r.json({users:x.rows.map(u=>({id:Number(u.id),name:u.name,email:u.email,code:u.code,createdAt:u.created_at,verified:!!u.email_verified_at,banned:!!u.banned_at,banReason:u.ban_reason,postCount:u.post_count,online:onlineByCode.has(u.code)})),hasMore:x.rows.length===limit,offset:offset+x.rows.length});
-}catch(e){console.error("admin-users",e);r.status(500).json({error:"Não foi possível carregar os usuários."})}});
-
-app.post("/api/admin/users/:id/ban",async(q,r)=>{try{
-  const admin=await requireAdmin(q,r);if(!admin)return;
-  const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Usuário inválido."});
-  const target=await pool.query("SELECT id,email FROM users WHERE id=$1 LIMIT 1",[id]);if(!target.rowCount)return r.status(404).json({error:"Usuário não encontrado."});
-  if(isAdminUser(target.rows[0]))return r.status(400).json({error:"Não é possível banir o administrador."});
-  const reason=String(q.body?.reason||"").trim().slice(0,300)||null;
-  await pool.query("UPDATE users SET banned_at=NOW(),ban_reason=$2 WHERE id=$1",[id,reason]);
-  await securityEvent(id,"ADMIN_BANNED",{data:{by:admin.email,reason}});
-  r.json({ok:true});
-}catch(e){console.error("admin-ban",e);r.status(500).json({error:"Não foi possível suspender o usuário."})}});
-
-app.post("/api/admin/users/:id/unban",async(q,r)=>{try{
-  const admin=await requireAdmin(q,r);if(!admin)return;
-  const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Usuário inválido."});
-  await pool.query("UPDATE users SET banned_at=NULL,ban_reason=NULL WHERE id=$1",[id]);
-  await securityEvent(id,"ADMIN_UNBANNED",{data:{by:admin.email}});
-  r.json({ok:true});
-}catch(e){console.error("admin-unban",e);r.status(500).json({error:"Não foi possível reativar o usuário."})}});
-
-app.get("/api/admin/reports",async(q,r)=>{try{
-  const admin=await requireAdmin(q,r);if(!admin)return;
-  const status=String(q.query?.status||"open");
-  const x=await pool.query(`SELECT rp.id,rp.reason,rp.details,rp.status,rp.created_at,
-      reporter.name AS reporter_name,reporter.code AS reporter_code,
-      target.id AS target_id,target.name AS target_name,target.code AS target_code,target.banned_at
-    FROM reports rp
-    JOIN users reporter ON reporter.id=rp.reporter_id
-    JOIN users target ON target.id=rp.target_id
-    WHERE ($1='all' OR rp.status=$1)
-    ORDER BY rp.created_at DESC LIMIT 200`,[status]);
-  r.json({reports:x.rows.map(v=>({id:Number(v.id),reason:v.reason,details:v.details||"",status:v.status,createdAt:v.created_at,
-    reporter:{name:v.reporter_name,code:v.reporter_code},
-    target:{id:Number(v.target_id),name:v.target_name,code:v.target_code,banned:!!v.banned_at}}))});
-}catch(e){console.error("admin-reports",e);r.status(500).json({error:"Não foi possível carregar as denúncias."})}});
-
-app.post("/api/admin/reports/:id/resolve",async(q,r)=>{try{
-  const admin=await requireAdmin(q,r);if(!admin)return;
-  const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Denúncia inválida."});
-  const x=await pool.query("UPDATE reports SET status='resolved' WHERE id=$1 RETURNING id",[id]);
-  if(!x.rowCount)return r.status(404).json({error:"Denúncia não encontrada."});
-  r.json({ok:true});
-}catch(e){console.error("admin-report-resolve",e);r.status(500).json({error:"Não foi possível atualizar a denúncia."})}});
-
-app.get("/api/admin/servers",async(q,r)=>{try{
-  const admin=await requireAdmin(q,r);if(!admin)return;
-  const search=String(q.query?.q||"").trim().slice(0,60),like=`%${search}%`;
-  const x=await pool.query(`SELECT c.id,c.name,c.description,c.is_public,c.icon,c.created_at,owner.name AS owner_name,owner.code AS owner_code,
-      (SELECT COUNT(*)::int FROM community_members cm WHERE cm.community_id=c.id) AS member_count
-    FROM communities c JOIN users owner ON owner.id=c.owner_id
-    WHERE ($1='' OR c.name ILIKE $2)
-    ORDER BY member_count DESC LIMIT 200`,[search,like]);
-  r.json({servers:x.rows.map(v=>({id:Number(v.id),name:v.name,description:v.description||"",isPublic:!!v.is_public,icon:v.icon||"🌐",createdAt:v.created_at,owner:{name:v.owner_name,code:v.owner_code},memberCount:v.member_count}))});
-}catch(e){console.error("admin-servers",e);r.status(500).json({error:"Não foi possível carregar os servidores."})}});
-
-app.delete("/api/admin/servers/:id",async(q,r)=>{try{
-  const admin=await requireAdmin(q,r);if(!admin)return;
-  const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Servidor inválido."});
-  const x=await pool.query("DELETE FROM communities WHERE id=$1 RETURNING id",[id]);
-  if(!x.rowCount)return r.status(404).json({error:"Servidor não encontrado."});
-  r.json({ok:true});
-}catch(e){console.error("admin-server-delete",e);r.status(500).json({error:"Não foi possível excluir o servidor."})}});
-
-app.delete("/api/admin/posts/:id",async(q,r)=>{try{
-  const admin=await requireAdmin(q,r);if(!admin)return;
-  const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
-  const x=await pool.query("DELETE FROM social_posts WHERE id=$1 RETURNING id",[id]);
-  if(!x.rowCount)return r.status(404).json({error:"Publicação não encontrada."});
-  r.json({ok:true});
-}catch(e){console.error("admin-post-delete",e);r.status(500).json({error:"Não foi possível excluir a publicação."})}});
-
-
-/* Random matchmaking: fila persistente e resultado persistente no PostgreSQL. */
-function randomRoomId(){return "random-"+crypto.randomBytes(8).toString("hex")}
-async function clearRandomForUser(userId){
- const uid=Number(userId); if(!Number.isSafeInteger(uid)||uid<1)return;
- try{await pool.query("DELETE FROM random_queue WHERE user_id=$1",[uid])}catch(e){console.error("random-clear",e?.message||e)}
-}
-async function activeRandomMatch(userId){
- const uid=Number(userId);if(!Number.isSafeInteger(uid)||uid<1)return null;
- const x=await pool.query(`SELECT rm.match_id,rm.room,rm.user_a,rm.user_b,ua.code AS a_code,ua.name AS a_name,ua.avatar_mime AS a_avatar_mime,ua.avatar_updated_at AS a_avatar_updated_at,ub.code AS b_code,ub.name AS b_name,ub.avatar_mime AS b_avatar_mime,ub.avatar_updated_at AS b_avatar_updated_at
-   FROM random_matches rm JOIN users ua ON ua.id=rm.user_a JOIN users ub ON ub.id=rm.user_b
-   WHERE (rm.user_a=$1 OR rm.user_b=$1) AND rm.status='active' AND rm.expires_at>NOW() ORDER BY rm.created_at DESC LIMIT 1`,[uid]);
- if(!x.rowCount)return null;
- const m=x.rows[0],a={userId:Number(m.user_a),code:m.a_code,name:m.a_name,avatarUrl:avatarUrlFor({code:m.a_code,avatar_mime:m.a_avatar_mime,avatar_updated_at:m.a_avatar_updated_at})},b={userId:Number(m.user_b),code:m.b_code,name:m.b_name,avatarUrl:avatarUrlFor({code:m.b_code,avatar_mime:m.b_avatar_mime,avatar_updated_at:m.b_avatar_updated_at})};
- const partner=uid===a.userId?b:a;
- return {matchId:m.match_id,room:m.room,...partner};
-}
-async function endRandomMatchesForUser(userId){
- const uid=Number(userId);if(!Number.isSafeInteger(uid)||uid<1)return;
- await pool.query("UPDATE random_matches SET status='ended' WHERE (user_a=$1 OR user_b=$1) AND status='active'",[uid]);
-}
-async function findRandomMatch(userId){
- const uid=Number(userId); if(!Number.isSafeInteger(uid)||uid<1)return null;
- const me=await getUserById(uid);if(!me)return null;
- const existing=await activeRandomMatch(uid);if(existing)return existing;
- const client=await pool.connect();let match=null;
- try{
-   await client.query("BEGIN");
-   await client.query("DELETE FROM random_queue WHERE joined_at < NOW()-INTERVAL '10 minutes' OR last_seen_at < NOW()-INTERVAL '20 seconds'");
-   const candidate=await client.query(`
-     SELECT rq.user_id,rq.joined_at,u.code,u.name,u.avatar_mime,u.avatar_updated_at
-     FROM random_queue rq JOIN users u ON u.id=rq.user_id
-     JOIN user_privacy up ON up.user_id=rq.user_id
-     WHERE rq.user_id<>$1 AND rq.joined_at>=NOW()-INTERVAL '10 minutes' AND rq.last_seen_at>=NOW()-INTERVAL '20 seconds' AND up.random_enabled=TRUE
-       AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE b.user_id=$1 AND b.blocked_id=rq.user_id)
-       AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE b.user_id=rq.user_id AND b.blocked_id=$1)
-     ORDER BY rq.joined_at ASC FOR UPDATE OF rq SKIP LOCKED LIMIT 1`,[uid]);
-   if(!candidate.rowCount){await client.query("COMMIT");return null}
-   const other=candidate.rows[0];
-   await client.query("DELETE FROM random_queue WHERE user_id IN ($1,$2)",[uid,Number(other.user_id)]);
-   const matchId=crypto.randomBytes(8).toString("hex"),room=randomRoomId();
-   await client.query("INSERT INTO random_matches(match_id,user_a,user_b,room,status) VALUES($1,$2,$3,$4,'active')",[matchId,uid,Number(other.user_id),room]);
-   match={matchId,room,partnerOther:{userId:Number(other.user_id),code:other.code,name:other.name,avatarUrl:avatarUrlFor(other)}};
-   await client.query("COMMIT");
- }catch(e){try{await client.query("ROLLBACK")}catch(_){}throw e}finally{client.release()}
- if(match){
-   notifyUser(me.code,"random-match-found",{matchId:match.matchId,room:match.room,partner:match.partnerOther});
-   notifyUser(match.partnerOther.code,"random-match-found",{matchId:match.matchId,room:match.room,partner:{userId:uid,code:me.code,name:me.name,avatarUrl:avatarUrlFor(me)}});
-   return {matchId:match.matchId,room:match.room,...match.partnerOther};
- }
- return null;
-}
-app.post("/api/random/queue",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;
- if(!rateLimit("random:"+u.id,30,60*1000))return r.status(429).json({error:"Muitas tentativas de conexão. Aguarde um pouco."});
- const p=await privacyFor(u.id);if(!p.random_enabled)return r.status(403).json({error:"Ative Conhecer alguém nas configurações de privacidade antes de entrar na fila.",code:"RANDOM_DISABLED"});
- const existing=await activeRandomMatch(u.id);if(existing)return r.json({ok:true,match:existing});
- await pool.query("INSERT INTO random_queue(user_id,joined_at,last_seen_at) VALUES($1,NOW(),NOW()) ON CONFLICT(user_id) DO UPDATE SET last_seen_at=NOW()",[u.id]);
- const match=await findRandomMatch(u.id);if(match)return r.json({ok:true,match});
- r.json({ok:true,waiting:true,position:null});
-}catch(e){console.error("random-queue",e);r.status(500).json({error:"Não foi possível entrar na fila. Tente novamente em alguns segundos."})}});
-app.post("/api/random/leave",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;await clearRandomForUser(u.id);await endRandomMatchesForUser(u.id);r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível cancelar a fila."})}});
-app.post("/api/random/next",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;await endRandomMatchesForUser(u.id);await clearRandomForUser(u.id);
- const p=await privacyFor(u.id);if(!p.random_enabled)return r.status(403).json({error:"Ative Conhecer alguém nas configurações de privacidade.",code:"RANDOM_DISABLED"});
- await pool.query("INSERT INTO random_queue(user_id,joined_at,last_seen_at) VALUES($1,NOW(),NOW()) ON CONFLICT(user_id) DO UPDATE SET joined_at=NOW(),last_seen_at=NOW()",[u.id]);
- const match=await findRandomMatch(u.id);if(match)return r.json({ok:true,match});r.json({ok:true,waiting:true});
-}catch(e){console.error("random-next",e);r.status(500).json({error:"Não foi possível procurar outra pessoa."})}});
-
+app.get("/",(_,r)=>r.send("Conversa Live server OK — v3.0.6 PostgreSQL + música"));
 app.get("/health",async(_,r)=>{
-  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"1.5.0",service:"conversa-live-server"});
-  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"1.5.0",service:"conversa-live-server"})}
-  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"1.5.0",service:"conversa-live-server"})}
+  if(!dbReady)return r.status(503).json({ok:false,database:false,version:"3.0.6",service:"conversa-live-server"});
+  try{await pool.query("SELECT 1");r.json({ok:true,database:true,version:"3.0.6",service:"conversa-live-server"})}
+  catch(e){dbReady=false;r.status(503).json({ok:false,database:false,version:"3.0.6",service:"conversa-live-server"})}
 });
 
 // Music bot: searches the Audius catalog and streams public/authorized tracks.
@@ -723,161 +236,26 @@ app.get("/health",async(_,r)=>{
 // AUDIUS_BEARER_TOKEN in Render when required by the Audius API plan.
 app.get("/api/me",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;r.json({user:pub(u)})}catch(e){r.status(500).json({error:"Erro ao carregar perfil."})}});
 app.patch("/api/me",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const name=cleanName(q.body?.name);if(name.length<2)return r.status(400).json({error:"O nome precisa ter pelo menos 2 caracteres."});await pool.query("UPDATE users SET name=$1 WHERE id=$2",[name,u.id]);const updated=await getUserById(u.id);r.json({user:pub(updated)})}catch(e){console.error(e);r.status(500).json({error:"Não foi possível salvar o perfil."})}});
-const avatarUpload=multer({storage:multer.memoryStorage(),limits:{fileSize:6*1024*1024},fileFilter:(req,file,cb)=>{const ok=/^image\/(jpeg|png|webp|gif)$/i.test(file.mimetype);cb(ok?null:new Error("Use uma imagem JPG, PNG, WEBP ou GIF."),ok)}});
-app.post("/api/me/avatar",(req,res,next)=>{avatarUpload.single("avatar")(req,res,err=>{if(err)return res.status(err.code==="LIMIT_FILE_SIZE"?413:400).json({error:err.message||"Não foi possível receber a imagem."});next()})},async(q,r)=>{
- try{
-  const u=await auth(q,r);if(!u)return;
-  if(!q.file)return r.status(400).json({error:"Escolha uma imagem."});
-  if(!rateLimit("avatar:"+u.id,10,60*1000))return r.status(429).json({error:"Muitas trocas de foto em pouco tempo. Aguarde um instante."});
-  await pool.query("UPDATE users SET avatar_mime=$1,avatar_data=$2,avatar_updated_at=NOW() WHERE id=$3",[q.file.mimetype,q.file.buffer,u.id]);
-  const updated=await getUserById(u.id);
-  r.json({user:pub(updated)});
- }catch(e){console.error("avatar-upload",e);r.status(500).json({error:"Não foi possível salvar a foto."})}
-});
-app.delete("/api/me/avatar",async(q,r)=>{
- try{
-  const u=await auth(q,r);if(!u)return;
-  await pool.query("UPDATE users SET avatar_mime=NULL,avatar_data=NULL,avatar_updated_at=NULL WHERE id=$1",[u.id]);
-  const updated=await getUserById(u.id);
-  r.json({user:pub(updated)});
- }catch(e){console.error(e);r.status(500).json({error:"Não foi possível remover a foto."})}
-});
-app.get("/api/avatar/:code",async(q,r)=>{
- try{
-  const x=await pool.query("SELECT avatar_mime,avatar_data,avatar_updated_at FROM users WHERE code=$1 LIMIT 1",[String(q.params.code||"").trim().toUpperCase()]);
-  const row=x.rows[0];
-  if(!row?.avatar_mime||!row.avatar_data)return r.status(404).end();
-  const etag='"'+(row.avatar_updated_at?new Date(row.avatar_updated_at).getTime():0)+'"';
-  if(q.headers["if-none-match"]===etag)return r.status(304).end();
-  r.setHeader("Content-Type",row.avatar_mime);r.setHeader("Cache-Control","public, max-age=86400");r.setHeader("ETag",etag);
-  r.end(row.avatar_data);
- }catch(e){console.error("avatar-serve",e);r.status(500).end()}
-});
 function feedPublic(row,viewerId){
  return {
   id:row.id,body:row.body||"",created_at:row.created_at,author_id:row.author_id,name:row.name,code:row.code,
-  avatarUrl:avatarUrlFor({code:row.code,avatar_mime:row.avatar_mime,avatar_updated_at:row.avatar_updated_at}),
-  likes:Number(row.likes||0),liked:!!row.liked,saves:Number(row.saves||0),saved:!!row.saved,comments:Number(row.comments||0),isFollowing:!!row.is_following,isFriend:!!row.is_friend,
+  likes:Number(row.likes||0),liked:!!row.liked,
   media:row.media_id?{id:row.media_id,type:row.media_type,name:row.media_name,mime:row.media_mime,size:Number(row.media_size||0),duration:Number(row.media_duration||0),url:"/api/feed/media/"+row.media_id+"?mt="+encodeURIComponent(makeMediaToken(row.media_id,viewerId))}:null
  };
 }
 app.get("/api/feed",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
- const limit=Math.min(Math.max(Number(q.query.limit)||8,1),12);
- const offset=Math.min(Math.max(Number(q.query.offset)||0,0),10000);
- const filter=String(q.query.filter||"for_you");
- const friendsOnly=filter==="friends"||filter==="following";
- // Keep the feed query deliberately simple and index-friendly. The previous
- // version joined likes/comments/saves together, which multiplied rows
- // (likes x comments x saves) and could make the endpoint extremely slow or
- // fail on real datasets. Correlated counts avoid that multiplication.
- const whereFriends=filter==="following"
-   ? "AND (p.author_id=$1 OR EXISTS(SELECT 1 FROM user_follows uf WHERE uf.follower_id=$1 AND uf.following_id=p.author_id))"
-   : filter==="friends"
-   ? "AND (p.author_id=$1 OR EXISTS(SELECT 1 FROM friendships f WHERE f.user_id=$1 AND f.friend_id=p.author_id))"
-   : "";
- const x=await pool.query(`WITH ranked AS (
-   SELECT p.id,p.body,p.created_at,p.media_type,p.media_name,p.media_mime,p.media_size,p.media_duration,
-     CASE WHEN p.media_data IS NOT NULL THEN p.id END AS media_id,
-     u.id AS author_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,
-     (SELECT COUNT(*)::int FROM social_likes l WHERE l.post_id=p.id) AS likes,
-     EXISTS(SELECT 1 FROM social_likes l WHERE l.post_id=p.id AND l.user_id=$1) AS liked,
-     (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id=p.id) AS comments,
-     (SELECT COUNT(*)::int FROM social_saves sv WHERE sv.post_id=p.id) AS saves,
-     EXISTS(SELECT 1 FROM social_saves sv WHERE sv.post_id=p.id AND sv.user_id=$1) AS saved,
-     GREATEST(EXTRACT(EPOCH FROM (NOW()-p.created_at))/3600.0,0) AS age_hours,
-     EXISTS(SELECT 1 FROM friendships f WHERE f.user_id=$1 AND f.friend_id=p.author_id) AS is_friend,
-     EXISTS(SELECT 1 FROM user_follows uf WHERE uf.follower_id=$1 AND uf.following_id=p.author_id) AS is_following,
-     COALESCE((SELECT SUM(CASE WHEN e.event_type='like' THEN 4 WHEN e.event_type='comment' THEN 5 WHEN e.event_type='save' THEN 6 WHEN e.event_type='view' THEN 0.25 WHEN e.event_type='share' THEN 3 ELSE 0 END)
-       FROM feed_events e WHERE e.user_id=$1 AND e.post_id=p.id AND e.created_at>NOW()-INTERVAL '30 days'),0) AS personal_score,
-     COALESCE((SELECT COUNT(*)::int FROM feed_events e WHERE e.post_id=p.id AND e.event_type='view' AND e.created_at>NOW()-INTERVAL '7 days'),0) AS views7
+ const limit=Math.min(Math.max(Number(q.query.limit)||30,1),50);
+ const x=await pool.query(`SELECT p.id,p.body,p.created_at,p.media_type,p.media_name,p.media_mime,p.media_size,p.media_duration,
+   CASE WHEN p.media_data IS NOT NULL THEN p.id END AS media_id,
+   u.id AS author_id,u.name,u.code,COUNT(l.post_id)::int AS likes,BOOL_OR(l.user_id=$1) AS liked
    FROM social_posts p JOIN users u ON u.id=p.author_id
-   WHERE 1=1 ${whereFriends}
-     -- Limita o universo de posts que entram na pontuação a uma janela recente.
-     -- Sem isso, as subconsultas de engajamento rodam para TODO post já criado
-     -- antes mesmo de aplicar o LIMIT — a consulta ficava cada vez mais lenta
-     -- conforme a base de posts/eventos crescia. 21 dias é suficiente pra um
-     -- "para você" relevante sem escanear o histórico inteiro.
-     AND p.created_at > NOW() - INTERVAL '21 days'
-     AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.user_id=$1 AND b.blocked_id=p.author_id) OR (b.user_id=p.author_id AND b.blocked_id=$1))
- )
- SELECT *,
-   (likes*3.0 + comments*5.0 + saves*7.0 + LEAST(views7,500)*0.18
-    + CASE WHEN is_friend THEN 8 ELSE 0 END
-    + CASE WHEN is_following THEN 14 ELSE 0 END + personal_score*3
-    + CASE WHEN age_hours < 2 THEN 12 ELSE 0 END)
-   / POWER(age_hours+2,0.72) AS rank_score
- FROM ranked
- ORDER BY rank_score DESC,created_at DESC,id DESC
- LIMIT $2 OFFSET $3`,[u.id,limit,offset]);
- const total=await pool.query(`SELECT COUNT(*)::int AS n FROM social_posts p
-   WHERE 1=1 ${whereFriends}
-   AND p.created_at > NOW() - INTERVAL '21 days'
-   AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.user_id=$1 AND b.blocked_id=p.author_id) OR (b.user_id=p.author_id AND b.blocked_id=$1))`,[u.id]);
- r.json({posts:x.rows.map(p=>feedPublic(p,u.id)),hasMore:x.rows.length===limit,offset:offset+x.rows.length,totalPosts:Number(total.rows[0]?.n||0),algorithm:"freechat-for-you-v2"});
-}catch(e){console.error("feed-ranked",e);r.status(500).json({error:"Erro ao carregar o feed."})}});
-app.post("/api/feed/event",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;
- const postId=Number(q.body?.postId),type=String(q.body?.eventType||"view").slice(0,24),dwell=Math.min(Math.max(Number(q.body?.dwellMs)||0,0),120000);
- if(!Number.isSafeInteger(postId)||postId<1||!['view','dwell','like','comment','save','share','skip'].includes(type))return r.status(400).json({error:"Evento inválido."});
- if(!rateLimit("feed-event:"+u.id,180,60*1000))return r.status(429).json({error:"Muitas interações. Aguarde."});
- await pool.query("INSERT INTO feed_events(user_id,post_id,event_type,dwell_ms) SELECT $1,$2,$3,$4 WHERE EXISTS(SELECT 1 FROM social_posts WHERE id=$2)",[u.id,postId,type,dwell]);
- r.json({ok:true});
-}catch(e){console.error("feed-event",e);r.status(500).json({error:"Não foi possível registrar a interação."})}});
-async function canViewFeedPost(viewerId,postId){
- // Publicações do feed são públicas dentro do FreeChat para usuários autenticados.
- // A autenticação continua obrigatória para evitar acesso anônimo às ações da rede social.
- const x=await pool.query(`SELECT author_id FROM social_posts WHERE id=$1 LIMIT 1`,[postId]);
- if(!x.rowCount)return null;
- return Number(x.rows[0].author_id);
-}
-app.post("/api/feed/:id/like",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;
- const id=Number(q.params.id);
- if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
- if(!rateLimit("feed-like:"+u.id,120,60*1000))return r.status(429).json({error:"Muitas reações em pouco tempo. Aguarde um instante."});
- const authorId=await canViewFeedPost(u.id,id);
- if(authorId===null)return r.status(404).json({error:"Publicação não encontrada."});
- if(authorId===false)return r.status(403).json({error:"Você não pode interagir com esta publicação."});
- const exists=await pool.query("SELECT 1 FROM social_likes WHERE post_id=$1 AND user_id=$2",[id,u.id]);
- let liked;
- if(exists.rowCount){await pool.query("DELETE FROM social_likes WHERE post_id=$1 AND user_id=$2",[id,u.id]);liked=false}
- else {await pool.query("INSERT INTO social_likes(post_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[id,u.id]);liked=true}
- const c=await pool.query("SELECT COUNT(*)::int AS likes FROM social_likes WHERE post_id=$1",[id]);
- if(liked&&Number(authorId)!==Number(u.id))await addNotification(authorId,"social","Nova curtida",u.name+" curtiu sua publicação.",{postId:id});
- r.json({liked,likes:Number(c.rows[0].likes||0)});
-}catch(e){console.error(e);r.status(500).json({error:"Não foi possível atualizar a curtida."})}});
+   LEFT JOIN social_likes l ON l.post_id=p.id
+   WHERE p.author_id=$1 OR p.author_id IN (SELECT friend_id FROM friendships WHERE user_id=$1)
+   GROUP BY p.id,u.id ORDER BY p.created_at DESC LIMIT $2`,[u.id,limit]);
+ r.json({posts:x.rows.map(p=>feedPublic(p,u.id))});
+}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar o feed."})}});
 
-app.delete("/api/feed/:id",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;
- const id=Number(q.params.id);
- if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
- if(!rateLimit("feed-delete:"+u.id,30,60*1000))return r.status(429).json({error:"Muitas exclusões em pouco tempo. Aguarde um instante."});
- const x=await pool.query("DELETE FROM social_posts WHERE id=$1 AND author_id=$2 RETURNING id",[id,u.id]);
- if(!x.rowCount)return r.status(404).json({error:"Publicação não encontrada ou você não é o autor."});
- r.json({ok:true,id});
-}catch(e){console.error("feed-delete",e);r.status(500).json({error:"Não foi possível excluir a publicação."})}});
-
-app.get("/api/feed/:id/comments",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
- const visible=await canViewFeedPost(u.id,id);if(visible===null)return r.status(404).json({error:"Publicação não encontrada."});if(visible===false)return r.status(403).json({error:"Você não pode ver os comentários desta publicação."});
- const x=await pool.query(`SELECT c.id,c.body,c.created_at,u.name,u.code,u.avatar_mime,u.avatar_updated_at FROM social_comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=$1 ORDER BY c.created_at ASC LIMIT 100`,[id]);
- r.json({comments:x.rows.map(c=>({...c,avatarUrl:avatarUrlFor(c)}))});
-}catch(e){console.error(e);r.status(500).json({error:"Não foi possível carregar os comentários."})}});
-app.post("/api/feed/:id/comments",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),body=String(q.body?.body||"").trim();if(!Number.isSafeInteger(id)||id<1||!body)return r.status(400).json({error:"Comentário inválido."});if(body.length>800)return r.status(400).json({error:"O comentário pode ter no máximo 800 caracteres."});
- const visible=await canViewFeedPost(u.id,id);if(visible===null)return r.status(404).json({error:"Publicação não encontrada."});if(visible===false)return r.status(403).json({error:"Você não pode comentar nesta publicação."});
- const post=await pool.query("SELECT author_id FROM social_posts WHERE id=$1",[id]);
- const x=await pool.query(`INSERT INTO social_comments(post_id,user_id,body) VALUES($1,$2,$3) RETURNING id,body,created_at`,[id,u.id,body]);
- if(Number(post.rows[0].author_id)!==Number(u.id)){await addNotification(post.rows[0].author_id,"social","Novo comentário",u.name+" comentou em sua publicação.",{postId:id});}
- r.json({comment:{...x.rows[0],name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)}});
-}catch(e){console.error(e);r.status(500).json({error:"Não foi possível comentar."})}});
-app.post("/api/feed/:id/save",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);if(!Number.isSafeInteger(id)||id<1)return r.status(400).json({error:"Publicação inválida."});
- const visible=await canViewFeedPost(u.id,id);if(visible===null)return r.status(404).json({error:"Publicação não encontrada."});if(visible===false)return r.status(403).json({error:"Você não pode salvar esta publicação."});
- const exists=await pool.query("SELECT 1 FROM social_saves WHERE post_id=$1 AND user_id=$2",[id,u.id]);let saved;if(exists.rowCount){await pool.query("DELETE FROM social_saves WHERE post_id=$1 AND user_id=$2",[id,u.id]);saved=false}else{await pool.query("INSERT INTO social_saves(post_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[id,u.id]);saved=true}
- const c=await pool.query("SELECT COUNT(*)::int AS saves FROM social_saves WHERE post_id=$1",[id]);r.json({saved,saves:c.rows[0].saves});
-}catch(e){r.status(500).json({error:"Não foi possível salvar a publicação."})}});
 app.post("/api/feed",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
  const body=String(q.body?.body||"").trim();
@@ -917,26 +295,13 @@ app.get("/api/feed/media/:id",async(q,r)=>{try{
  const x=await pool.query(`SELECT p.id,p.author_id,p.media_mime,p.media_name,p.media_size,p.media_data
    FROM social_posts p WHERE p.id=$1 AND p.media_data IS NOT NULL LIMIT 1`,[id]);
  const row=x.rows[0];if(!row)return r.status(404).end();
- // <img>/<video> requests cannot attach the Authorization header. Authenticate
- // these media requests with the signed viewer token embedded in the media URL.
+ const me=await auth(q,r);if(!me)return;
+ const allowed=Number(row.author_id)===Number(me.id) || (await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[me.id,row.author_id])).rowCount;
+ if(!allowed)return r.status(403).end();
  const mt=String(q.query?.mt||"");
- let tokenViewerId=0;
- try{
-   const raw=Buffer.from(mt,"base64url").toString();
-   const parts=raw.split(".");
-   if(parts.length===4)tokenViewerId=Number(parts[1])||0;
- }catch(e){}
- if(!tokenViewerId || !verifyMediaToken(mt,id,tokenViewerId))return r.status(403).end();
- const me=await getUserById(tokenViewerId);
- if(!me)return r.status(401).end();
- const blocked=await pool.query("SELECT 1 FROM blocked_users WHERE (user_id=$1 AND blocked_id=$2) OR (user_id=$2 AND blocked_id=$1) LIMIT 1",[me.id,row.author_id]);
- if(blocked.rowCount)return r.status(403).end();
- // Feed media is available to any authenticated viewer. The signed token
- // proves which authenticated viewer requested the media, while the block
- // check preserves privacy controls. Posts themselves are public inside the
- // authenticated FreeChat feed, so requiring friendship here would make
- // public image/video posts silently fail for non-friends.
-
+ // feed media tokens are signed with the same media secret and viewer id
+ const tokenOk=verifyMediaToken(mt,id,me.id);
+ if(!tokenOk)return r.status(403).end();
  const buf=row.media_data,total=buf.length,mime=row.media_mime||"application/octet-stream";
  r.setHeader("Content-Type",mime);r.setHeader("Content-Disposition",`inline; filename*=UTF-8''${encodeURIComponent(row.media_name||"media")}`);
  r.setHeader("Accept-Ranges","bytes");r.setHeader("Cache-Control","private, max-age=3600");
@@ -947,6 +312,7 @@ app.get("/api/feed/media/:id",async(q,r)=>{try{
  r.setHeader("Content-Length",total);r.end(buf);
 }catch(e){console.error("feed-media",e);r.status(500).end()}});
 
+app.post("/api/feed/:id/like",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const id=Number(q.params.id);const exists=await pool.query("SELECT 1 FROM social_likes WHERE post_id=$1 AND user_id=$2",[id,u.id]);let liked;if(exists.rowCount){await pool.query("DELETE FROM social_likes WHERE post_id=$1 AND user_id=$2",[id,u.id]);liked=false}else{await pool.query("INSERT INTO social_likes(post_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[id,u.id]);liked=true}const c=await pool.query("SELECT COUNT(*)::int AS likes FROM social_likes WHERE post_id=$1",[id]);r.json({liked,likes:c.rows[0].likes})}catch(e){r.status(500).json({error:"Não foi possível reagir."})}});
 app.get("/api/notifications",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const x=await pool.query("SELECT id,type,title,body,data,read_at,created_at FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50",[u.id]);const unread=x.rows.filter(n=>!n.read_at).length;r.json({notifications:x.rows,unread})}catch(e){r.status(500).json({error:"Erro ao carregar notificações."})}});
 app.post("/api/notifications/read",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;await pool.query("UPDATE notifications SET read_at=NOW() WHERE user_id=$1 AND read_at IS NULL",[u.id]);r.json({ok:true})}catch(e){r.status(500).json({error:"Erro ao marcar notificações."})}});
 app.get("/api/music/search",async(q,r)=>{
@@ -963,10 +329,7 @@ app.get("/api/music/search",async(q,r)=>{
     if(process.env.AUDIUS_API_KEY)headers["x-api-key"]=process.env.AUDIUS_API_KEY;
     const x=await fetch(u,{headers});
     const body=await x.json().catch(()=>({}));
-    if(!x.ok){
-      console.error("Audius search",x.status,body?.message||body?.error||"");
-      return r.status(x.status===401||x.status===403?503:502).json({error:"O serviço de música recusou a busca. Verifique a chave do Audius no servidor."});
-    }
+    if(!x.ok)return r.status(x.status===401||x.status===403?503:502).json({error:"O serviço de música recusou a busca. Configure AUDIUS_API_KEY no Render."});
     const rows=Array.isArray(body.data)?body.data:[];
     r.json({tracks:rows.filter(t=>t&&t.id&&t.isStreamable!==false).slice(0,8).map(t=>({
       id:String(t.id),title:String(t.title||"Sem título").slice(0,120),artist:String(t.user?.name||"Artista desconhecido").slice(0,80),
@@ -999,15 +362,10 @@ app.get("/api/music/stream/:id",async(q,r)=>{
     if(process.env.AUDIUS_API_KEY)headers["x-api-key"]=process.env.AUDIUS_API_KEY;
     if(q.headers.range)headers.Range=q.headers.range;
     const x=await fetch(u,{headers,redirect:"follow"});
-    if(!x.ok){
-      const detail=await x.text().catch(()=>"");
-      console.error("Audius stream",x.status,detail.slice(0,300));
-      return r.status(x.status===401||x.status===403?503:502).json({error:"Não foi possível abrir o áudio desta faixa."});
-    }
+    if(!x.ok)return r.status(x.status===401||x.status===403?503:502).json({error:"Não foi possível abrir o áudio desta faixa."});
     const ct=x.headers.get("content-type")||"audio/mpeg";
     r.status(x.status);
     r.setHeader("Content-Type",ct);r.setHeader("Cache-Control","no-store");r.setHeader("Accept-Ranges","bytes");
-    r.setHeader("Access-Control-Allow-Origin",q.headers.origin||"*");
     for(const h of ["content-length","content-range","etag","last-modified"]){const v=x.headers.get(h);if(v)r.setHeader(h,v);}
     if(x.body){const {Readable}=require("stream");return Readable.fromWeb(x.body).pipe(r);}
     r.status(502).json({error:"Stream de áudio indisponível."});
@@ -1016,7 +374,6 @@ app.get("/api/music/stream/:id",async(q,r)=>{
 
 app.post("/api/register",guard,async(q,r)=>{
   try{
-    if(!emailConfigured())return r.status(503).json({error:"O envio de e-mail do FreeChat ainda não está configurado. Configure RESEND_API_KEY e RESEND_FROM no servidor."});
     const name=cleanName(q.body?.name),email=cleanEmail(q.body?.email),password=String(q.body?.password||"");
     if(name.length<2)return r.status(400).json({error:"O nome precisa ter pelo menos 2 caracteres."});
     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return r.status(400).json({error:"E-mail inválido."});
@@ -1024,51 +381,14 @@ app.post("/api/register",guard,async(q,r)=>{
     if(await getUserByEmail(email))return r.status(409).json({error:"Este e-mail já possui uma conta."});
     let c;do c=code();while(await getUserByCode(c));
     const salt=crypto.randomBytes(16).toString("hex"),h=await hashPassword(password);
-    const x=await pool.query("INSERT INTO users(name,email,code,salt,password_hash,email_verified_at) VALUES($1,$2,$3,$4,$5,NULL) RETURNING id,name,email,code,created_at,email_verified_at",[name,email,c,salt,h]);
+    const x=await pool.query("INSERT INTO users(name,email,code,salt,password_hash) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,code",[name,email,c,salt,h]);
     const u=x.rows[0];
-    try{
-      const token=await createEmailToken(u.id,"verify",VERIFY_TOKEN_TTL_MS);
-      const mail=verificationEmail(u,token);
-      await sendResendEmail({...mail,to:email,idempotencyKey:"freechat-verify-"+u.id+"-"+hashEmailToken(token).slice(0,20)});
-    }catch(mailErr){
-      await pool.query("DELETE FROM users WHERE id=$1",[u.id]);
-      throw mailErr;
-    }
     await securityEvent(u.id,"ACCOUNT_CREATED",{ip:requestIp(q),ua:q.headers["user-agent"]});
-    r.json({requiresEmailVerification:true,user:pub(u),message:"Conta criada. Enviamos um link de verificação para seu e-mail."});
+    r.json({user:pub(u),token:await token(u,{ip:requestIp(q),ua:q.headers["user-agent"]}),message:"Conta criada com sucesso."});
   }catch(e){
-    console.error("register",e);
-    const msg=e?.code==="RESEND_ERROR"?"Não foi possível enviar o e-mail de verificação. Tente novamente em alguns instantes.":e?.message||"Não foi possível criar a conta.";
-    r.status(e?.code==="EMAIL_NOT_CONFIGURED"?503:500).json({error:msg});
+    console.error(e);
+    r.status(500).json({error:e.message||"Não foi possível criar a conta."});
   }
-});
-app.get("/api/verify-email",async(q,r)=>{
-  try{
-    const token=String(q.query?.token||"").trim();
-    if(!token||token.length<20)return r.status(400).json({error:"Link de verificação inválido."});
-    const row=await getEmailToken(token,"verify");
-    if(!row)return r.status(400).json({error:"Este link de verificação é inválido, expirou ou já foi usado."});
-    const u=await getUserById(row.user_id);
-    if(!u)return r.status(404).json({error:"Conta não encontrada."});
-    await pool.query("UPDATE users SET email_verified_at=COALESCE(email_verified_at,NOW()) WHERE id=$1",[u.id]);
-    await pool.query("UPDATE email_tokens SET used_at=NOW() WHERE id=$1",[row.id]);
-    await securityEvent(u.id,"EMAIL_VERIFIED",{ip:requestIp(q),ua:q.headers["user-agent"]});
-    r.json({ok:true,message:"E-mail verificado com sucesso. Agora você pode entrar."});
-  }catch(e){console.error("verify-email",e);r.status(500).json({error:"Não foi possível verificar o e-mail."})}
-});
-app.post("/api/resend-verification",guard,async(q,r)=>{
-  const generic={ok:true,message:"Se houver uma conta não verificada para esse e-mail, enviaremos um novo link."};
-  try{
-    if(!emailConfigured())return r.status(200).json(generic);
-    const email=cleanEmail(q.body?.email);
-    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return r.json(generic);
-    const u=await getUserByEmail(email);
-    if(!u||u.email_verified_at)return r.json(generic);
-    const token=await createEmailToken(u.id,"verify",VERIFY_TOKEN_TTL_MS);
-    const mail=verificationEmail(u,token);
-    await sendResendEmail({...mail,to:u.email,idempotencyKey:"freechat-resend-verify-"+u.id+"-"+Math.floor(Date.now()/600000)});
-    return r.json(generic);
-  }catch(e){console.error("resend-verification",e);return r.json(generic)}
 });
 app.post("/api/login",guard,async(q,r)=>{
   try{
@@ -1078,13 +398,6 @@ app.post("/api/login",guard,async(q,r)=>{
     if(!u){noteFailedLogin(key);await securityEvent(null,"LOGIN_FAILED",{ip,ua:q.headers["user-agent"],data:{email}});return r.status(401).json({error:"E-mail ou senha incorretos."});}
     const ok=await verifyPassword(p,u.password_hash,u.salt);
     if(!ok){noteFailedLogin(key);await securityEvent(u.id,"LOGIN_FAILED",{ip,ua:q.headers["user-agent"]});return r.status(401).json({error:"E-mail ou senha incorretos."});}
-    if(!u.email_verified_at){
-      return r.status(403).json({error:"Confirme seu e-mail antes de entrar. Verifique sua caixa de entrada ou solicite um novo link.",verificationRequired:true});
-    }
-    if(u.banned_at){
-      await securityEvent(u.id,"LOGIN_BLOCKED_BANNED",{ip,ua:q.headers["user-agent"]});
-      return r.status(403).json({error:"Sua conta foi suspensa."+(u.ban_reason?" Motivo: "+u.ban_reason:"")+" Se acredita que isso é um engano, entre em contato com o suporte."});
-    }
     clearFailedLogin(key);
     if(!String(u.password_hash).startsWith("scrypt$")){const upgraded=await hashPassword(p);await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2",[upgraded,u.id]);}
     const t=await token(u,{ip,ua:q.headers["user-agent"]});
@@ -1093,37 +406,6 @@ app.post("/api/login",guard,async(q,r)=>{
   }catch(e){console.error(e);r.status(500).json({error:"Erro ao entrar."});}
 });
 
-app.post("/api/forgot-password",guard,async(q,r)=>{
-  const generic={ok:true,message:"Se houver uma conta com esse e-mail, enviaremos instruções para redefinir a senha."};
-  try{
-    if(!emailConfigured())return r.json(generic);
-    const email=cleanEmail(q.body?.email);
-    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return r.json(generic);
-    const u=await getUserByEmail(email);
-    if(!u)return r.json(generic);
-    const token=await createEmailToken(u.id,"reset",EMAIL_TOKEN_TTL_MS);
-    const mail=passwordResetEmail(u,token);
-    await sendResendEmail({...mail,to:u.email,idempotencyKey:"freechat-reset-"+u.id+"-"+Math.floor(Date.now()/600000)});
-    return r.json(generic);
-  }catch(e){console.error("forgot-password",e);return r.json(generic)}
-});
-app.post("/api/reset-password",guard,async(q,r)=>{
-  try{
-    const token=String(q.body?.token||"").trim(),next=String(q.body?.password||"");
-    if(!token)return r.status(400).json({error:"Token de redefinição inválido."});
-    if(next.length<10||!/[A-Za-z]/.test(next)||!/[0-9]/.test(next))return r.status(400).json({error:"A nova senha precisa ter pelo menos 10 caracteres e incluir letras e números."});
-    const row=await getEmailToken(token,"reset");
-    if(!row)return r.status(400).json({error:"Este link de redefinição é inválido, expirou ou já foi usado."});
-    const u=await getUserById(row.user_id);
-    if(!u)return r.status(404).json({error:"Conta não encontrada."});
-    const h=await hashPassword(next);
-    await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2",[h,u.id]);
-    await pool.query("UPDATE email_tokens SET used_at=NOW() WHERE id=$1",[row.id]);
-    await pool.query("DELETE FROM app_sessions WHERE user_id=$1",[u.id]);
-    await securityEvent(u.id,"PASSWORD_RESET",{ip:requestIp(q),ua:q.headers["user-agent"]});
-    r.json({ok:true,message:"Senha redefinida com sucesso. Agora você pode entrar."});
-  }catch(e){console.error("reset-password",e);r.status(500).json({error:"Não foi possível redefinir a senha."})}
-});
 app.post("/api/logout",async(q,r)=>{try{const raw=String(q.headers.authorization||"");const t=raw.startsWith("Bearer ")?raw.slice(7).trim():"";if(t){const sess=await getSession(t);if(sess)await securityEvent(sess.userId,"LOGOUT",{ip:requestIp(q),ua:q.headers["user-agent"]});sessions.delete(t);await pool.query("DELETE FROM app_sessions WHERE token=$1",[sessionHash(t)]);}r.json({ok:true})}catch(e){r.json({ok:true})}});
 
 app.get("/api/security/sessions",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const raw=String(q.headers.authorization||"");const current=raw.startsWith("Bearer ")?sessionHash(raw.slice(7).trim()):"";const x=await pool.query("SELECT token,created_at,last_seen_at,user_agent,expires_at FROM app_sessions WHERE user_id=$1 AND expires_at>NOW() ORDER BY last_seen_at DESC",[u.id]);r.json({sessions:x.rows.map(v=>({id:crypto.createHash("sha256").update(v.token).digest("hex").slice(0,12),current:v.token===current,created_at:v.created_at,last_seen_at:v.last_seen_at,expires_at:v.expires_at,user_agent:v.user_agent||"Navegador"}))})}catch(e){r.status(500).json({error:"Não foi possível carregar as sessões."})}});
@@ -1144,7 +426,7 @@ async function getFriendForDM(me,code){
  return {other};
 }
 const mediaSecret=String(process.env.SESSION_SECRET||process.env.DATABASE_URL||crypto.randomBytes(32).toString("hex"));
-function makeMediaToken(messageId,userId){const exp=Math.floor(Date.now()/1000)+60*60*24*7;const raw=`${messageId}.${userId}.${exp}`;const sig=crypto.createHmac("sha256",mediaSecret).update(raw).digest("base64url");return Buffer.from(`${raw}.${sig}`).toString("base64url");}
+function makeMediaToken(messageId,userId){const exp=Math.floor(Date.now()/1000)+60*30;const raw=`${messageId}.${userId}.${exp}`;const sig=crypto.createHmac("sha256",mediaSecret).update(raw).digest("base64url");return Buffer.from(`${raw}.${sig}`).toString("base64url");}
 function verifyMediaToken(token,messageId,userId){try{const raw=Buffer.from(String(token||""),"base64url").toString();const parts=raw.split(".");if(parts.length!==4)return false;const [mid,uid,exp,sig]=parts;if(Number(mid)!==Number(messageId)||Number(uid)!==Number(userId)||Number(exp)<Math.floor(Date.now()/1000))return false;const expected=crypto.createHmac("sha256",mediaSecret).update(`${mid}.${uid}.${exp}`).digest("base64url");return crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(expected));}catch(e){return false}}
 function messagePublic(row,viewerId){return {id:row.id,sender_id:row.sender_id,receiver_id:row.receiver_id,body:row.body||"",created_at:row.created_at,read_at:row.read_at,media:row.media_id?{id:row.media_id,type:row.media_type,name:row.media_name,mime:row.media_mime,size:Number(row.media_size||0),duration:Number(row.media_duration||0),url:"/api/messages/media/"+row.media_id+"?mt="+encodeURIComponent(makeMediaToken(row.media_id,viewerId))}:null};}
 app.get("/api/messages/unread",async(q,r)=>{
@@ -1153,38 +435,6 @@ app.get("/api/messages/unread",async(q,r)=>{
   const x=await pool.query(`SELECT u.code,COUNT(*)::int AS count FROM direct_messages m JOIN users u ON u.id=m.sender_id WHERE m.receiver_id=$1 AND m.read_at IS NULL GROUP BY u.code`,[me.id]);
   const unread={};x.rows.forEach(row=>unread[row.code]=Number(row.count||0));r.json({unread});
  }catch(e){console.error(e);r.status(500).json({error:"Não foi possível carregar notificações."})}
-});
-app.get("/api/messages/conversations",async(q,r)=>{
- try{
-  const me=await auth(q,r);if(!me)return;
-  const x=await pool.query(`WITH ranked AS (
-    SELECT m.*,CASE WHEN m.sender_id=$1 THEN m.receiver_id ELSE m.sender_id END AS other_id,
-           ROW_NUMBER() OVER(PARTITION BY CASE WHEN m.sender_id=$1 THEN m.receiver_id ELSE m.sender_id END ORDER BY m.created_at DESC,m.id DESC) rn
-    FROM direct_messages m WHERE m.sender_id=$1 OR m.receiver_id=$1
-  )
-  SELECT r.other_id,u.name,u.code,u.avatar_mime,u.avatar_updated_at,r.id AS last_message_id,r.body AS last_body,
-         r.created_at AS last_created_at,r.sender_id AS last_sender_id,
-         CASE WHEN r.media_data IS NOT NULL THEN r.media_type ELSE NULL END AS last_media_type,
-         EXISTS(SELECT 1 FROM direct_chat_pins p WHERE p.user_id=$1 AND p.other_id=r.other_id) AS pinned,
-         (SELECT COUNT(*)::int FROM direct_messages um WHERE um.sender_id=r.other_id AND um.receiver_id=$1 AND um.read_at IS NULL) AS unread_count
-  FROM ranked r JOIN users u ON u.id=r.other_id
-  WHERE r.rn=1
-  ORDER BY pinned DESC,r.last_created_at DESC NULLS LAST`,[me.id]);
-  r.json({conversations:x.rows.map(v=>({code:v.code,name:v.name,avatarUrl:v.avatar_mime?`/api/avatar/${encodeURIComponent(v.code)}?v=${Number(v.avatar_updated_at||0)}`:null,lastMessage:{id:v.last_message_id,body:v.last_body||"",created_at:v.last_created_at,sender_id:v.last_sender_id,mediaType:v.last_media_type||null},pinned:!!v.pinned,unread:Number(v.unread_count||0)}))});
- }catch(e){console.error("dm-conversations",e);r.status(500).json({error:"Não foi possível carregar suas conversas."})}
-});
-app.post("/api/messages/conversations/:code/pin",async(q,r)=>{
- try{
-  const me=await auth(q,r);if(!me)return;
-  const other=await getUserByCode(String(q.params.code||"").trim().toUpperCase());if(!other)return r.status(404).json({error:"Usuário não encontrado."});
-  if(Number(other.id)===Number(me.id))return r.status(400).json({error:"Conversa inválida."});
-  const exists=await pool.query("SELECT 1 FROM direct_messages WHERE (sender_id=$1 AND receiver_id=$2) OR (sender_id=$2 AND receiver_id=$1) LIMIT 1",[me.id,other.id]);
-  if(!exists.rowCount)return r.status(404).json({error:"Essa conversa ainda não existe."});
-  const pinned=await pool.query("SELECT 1 FROM direct_chat_pins WHERE user_id=$1 AND other_id=$2",[me.id,other.id]);
-  if(pinned.rowCount){await pool.query("DELETE FROM direct_chat_pins WHERE user_id=$1 AND other_id=$2",[me.id,other.id]);return r.json({pinned:false});}
-  await pool.query("INSERT INTO direct_chat_pins(user_id,other_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[me.id,other.id]);
-  r.json({pinned:true});
- }catch(e){console.error("dm-pin",e);r.status(500).json({error:"Não foi possível fixar a conversa."})}
 });
 app.get("/api/messages/:code",async(q,r)=>{
  try{
@@ -1246,80 +496,26 @@ app.post("/api/messages/media",(req,res,next)=>{upload.single("file")(req,res,er
   const message=messagePublic({...x.rows[0],...row.rows[0]},me.id);notifyUser(other.code,"dm-new",{code:me.code,fromName:me.name,message}); await addNotification(other.id,"message","Nova mensagem",me.name+" enviou uma mensagem.",{code:me.code});r.json({message});
  }catch(e){console.error("message-media-upload",e);r.status(500).json({error:"Não foi possível enviar o arquivo."})}
 });
-async function privacyFor(userId){const x=await pool.query("SELECT message_policy,call_policy,friend_policy,random_enabled FROM user_privacy WHERE user_id=$1",[userId]);if(x.rowCount)return x.rows[0];await pool.query("INSERT INTO user_privacy(user_id) VALUES($1) ON CONFLICT DO NOTHING",[userId]);return {message_policy:"friends",call_policy:"friends",friend_policy:"everyone",random_enabled:false}}
+async function privacyFor(userId){const x=await pool.query("SELECT message_policy,call_policy,friend_policy FROM user_privacy WHERE user_id=$1",[userId]);if(x.rowCount)return x.rows[0];await pool.query("INSERT INTO user_privacy(user_id) VALUES($1) ON CONFLICT DO NOTHING",[userId]);return {message_policy:"friends",call_policy:"friends",friend_policy:"everyone"}}
 async function areFriends(a,b){return (await pool.query("SELECT 1 FROM friendships WHERE (user_id=$1 AND friend_id=$2) LIMIT 1",[a,b])).rowCount>0}
 async function isBlocked(a,b){return (await pool.query("SELECT 1 FROM blocked_users WHERE (user_id=$1 AND blocked_id=$2) OR (user_id=$2 AND blocked_id=$1) LIMIT 1",[a,b])).rowCount>0}
 async function canContact(targetId,meId,policy){if(await isBlocked(targetId,meId))return false;if(policy==="everyone")return true;if(policy==="nobody")return false;return areFriends(targetId,meId)}
 app.get("/api/security/privacy",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;r.json(await privacyFor(u.id))}catch(e){r.status(500).json({error:"Não foi possível carregar a privacidade."})}});
-async function updatePrivacy(q,r){
- const u=await auth(q,r);if(!u)return;
- const allowed=["everyone","friends","nobody"];
- const current=await privacyFor(u.id);
- const m=q.body?.message_policy===undefined?current.message_policy:String(q.body.message_policy);
- const c=q.body?.call_policy===undefined?current.call_policy:String(q.body.call_policy);
- const f=q.body?.friend_policy===undefined?current.friend_policy:String(q.body.friend_policy);
- const randomEnabled=q.body?.random_enabled===undefined?!!current.random_enabled:q.body.random_enabled===true;
- if(!allowed.includes(m)||!allowed.includes(c)||!allowed.includes(f))return r.status(400).json({error:"Configuração de privacidade inválida."});
- await pool.query("INSERT INTO user_privacy(user_id,message_policy,call_policy,friend_policy,random_enabled) VALUES($1,$2,$3,$4,$5) ON CONFLICT(user_id) DO UPDATE SET message_policy=EXCLUDED.message_policy,call_policy=EXCLUDED.call_policy,friend_policy=EXCLUDED.friend_policy,random_enabled=EXCLUDED.random_enabled",[u.id,m,c,f,randomEnabled]);
- if(!randomEnabled) await clearRandomForUser(u.id);
- await securityEvent(u.id,"PRIVACY_UPDATED",{ip:requestIp(q),ua:q.headers["user-agent"]});
- r.json({message_policy:m,call_policy:c,friend_policy:f,random_enabled:randomEnabled});
-}
-app.post("/api/security/privacy",async(q,r)=>{try{await updatePrivacy(q,r)}catch(e){console.error("privacy-update-post",e);if(!r.headersSent)r.status(500).json({error:"Não foi possível salvar a privacidade."})}});
-app.patch("/api/security/privacy",async(q,r)=>{try{await updatePrivacy(q,r)}catch(e){console.error("privacy-update-patch",e);if(!r.headersSent)r.status(500).json({error:"Não foi possível salvar a privacidade."})}});
+app.patch("/api/security/privacy",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const allowed=["everyone","friends","nobody"];const m=String(q.body?.message_policy||"friends"),c=String(q.body?.call_policy||"friends"),f=String(q.body?.friend_policy||"everyone");if(!allowed.includes(m)||!allowed.includes(c)||!allowed.includes(f))return r.status(400).json({error:"Configuração de privacidade inválida."});await pool.query("INSERT INTO user_privacy(user_id,message_policy,call_policy,friend_policy) VALUES($1,$2,$3,$4) ON CONFLICT(user_id) DO UPDATE SET message_policy=EXCLUDED.message_policy,call_policy=EXCLUDED.call_policy,friend_policy=EXCLUDED.friend_policy",[u.id,m,c,f]);await securityEvent(u.id,"PRIVACY_UPDATED",{ip:requestIp(q),ua:q.headers["user-agent"]});r.json({message_policy:m,call_policy:c,friend_policy:f})}catch(e){r.status(500).json({error:"Não foi possível salvar a privacidade."})}});
 
 app.get("/api/security/blocked",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const x=await pool.query("SELECT u.name,u.code FROM blocked_users b JOIN users u ON u.id=b.blocked_id WHERE b.user_id=$1 ORDER BY b.created_at DESC",[u.id]);r.json({blocked:x.rows})}catch(e){r.status(500).json({error:"Não foi possível carregar bloqueios."})}});
-app.post("/api/security/block",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const target=await getUserByCode(q.body?.code);if(!target||Number(target.id)===Number(u.id))return r.status(400).json({error:"Usuário inválido."});await pool.query("INSERT INTO blocked_users(user_id,blocked_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,target.id]);
- await pool.query("DELETE FROM user_follows WHERE (follower_id=$1 AND following_id=$2) OR (follower_id=$2 AND following_id=$1)",[u.id,target.id]);
- await pool.query("DELETE FROM friend_requests WHERE (sender_id=$1 AND receiver_id=$2) OR (sender_id=$2 AND receiver_id=$1)",[u.id,target.id]);
- await pool.query("DELETE FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1)",[u.id,target.id]);
- await securityEvent(u.id,"USER_BLOCKED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{target:target.code}});r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível bloquear."})}});
+app.post("/api/security/block",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const target=await getUserByCode(q.body?.code);if(!target||Number(target.id)===Number(u.id))return r.status(400).json({error:"Usuário inválido."});await pool.query("INSERT INTO blocked_users(user_id,blocked_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,target.id]);await securityEvent(u.id,"USER_BLOCKED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{target:target.code}});r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível bloquear."})}});
 app.post("/api/security/unblock",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;await pool.query("DELETE FROM blocked_users WHERE user_id=$1 AND blocked_id=(SELECT id FROM users WHERE code=$2)",[u.id,String(q.body?.code||"").trim().toUpperCase()]);r.json({ok:true})}catch(e){r.status(500).json({error:"Não foi possível desbloquear."})}});
 app.post("/api/security/report",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const target=await getUserByCode(q.body?.code);const reason=String(q.body?.reason||"").trim().slice(0,64),details=String(q.body?.details||"").trim().slice(0,1000);if(!target||Number(target.id)===Number(u.id)||!reason)return r.status(400).json({error:"Denúncia inválida."});await pool.query("INSERT INTO reports(reporter_id,target_id,reason,details) VALUES($1,$2,$3,$4)",[u.id,target.id,reason,details||null]);await securityEvent(u.id,"REPORT_CREATED",{ip:requestIp(q),ua:q.headers["user-agent"],data:{target:target.code,reason}});r.json({ok:true,message:"Denúncia registrada."})}catch(e){r.status(500).json({error:"Não foi possível registrar a denúncia."})}});
 
-app.get("/api/users/:code/profile",async(q,r)=>{try{
- const me=await auth(q,r);if(!me)return;
- const code=String(q.params.code||"").trim().toUpperCase();
- const target=await getUserByCode(code);if(!target)return r.status(404).json({error:"Usuário não encontrado."});
- if(await isBlocked(me.id,target.id))return r.status(404).json({error:"Usuário não encontrado."});
- const [counts,rel]=await Promise.all([
-  pool.query(`SELECT
-    (SELECT COUNT(*)::int FROM user_follows WHERE following_id=$1) AS followers,
-    (SELECT COUNT(*)::int FROM user_follows WHERE follower_id=$1) AS following,
-    (SELECT COUNT(*)::int FROM social_posts WHERE author_id=$1) AS posts`,[target.id]),
-  pool.query(`SELECT EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND following_id=$2) AS following,
-                    EXISTS(SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2) AS friend`,[me.id,target.id])
- ]);
- const c=counts.rows[0]||{};const rr=rel.rows[0]||{};
- r.json({user:pub(target),followers:Number(c.followers||0),following:Number(c.following||0),posts:Number(c.posts||0),isFollowing:!!rr.following,isFriend:!!rr.friend});
-}catch(e){console.error("user-profile",e);r.status(500).json({error:"Não foi possível carregar o perfil."})}});
-app.post("/api/follows/:code",async(q,r)=>{try{
- const me=await auth(q,r);if(!me)return;
- if(!rateLimit("follow:"+me.id,60,60*1000))return r.status(429).json({error:"Você fez muitas ações de seguir. Aguarde um momento."});
- const code=String(q.params.code||"").trim().toUpperCase();const target=await getUserByCode(code);
- if(!target||Number(target.id)===Number(me.id))return r.status(400).json({error:"Usuário inválido."});
- if(await isBlocked(me.id,target.id))return r.status(403).json({error:"Não é possível seguir este usuário."});
- const inserted=await pool.query("INSERT INTO user_follows(follower_id,following_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING follower_id",[me.id,target.id]);
- if(inserted.rowCount)await addNotification(target.id,"social","Novo seguidor",me.name+" começou a seguir você.",{code:me.code});
- const c=await pool.query("SELECT COUNT(*)::int AS n FROM user_follows WHERE following_id=$1",[target.id]);
- r.json({ok:true,following:true,followers:Number(c.rows[0]?.n||0),changed:!!inserted.rowCount});
-}catch(e){console.error("follow",e);r.status(500).json({error:"Não foi possível seguir este usuário."})}});
-app.delete("/api/follows/:code",async(q,r)=>{try{
- const me=await auth(q,r);if(!me)return;const target=await getUserByCode(String(q.params.code||"").trim().toUpperCase());
- if(target)await pool.query("DELETE FROM user_follows WHERE follower_id=$1 AND following_id=$2",[me.id,target.id]);
- const c=target?await pool.query("SELECT COUNT(*)::int AS n FROM user_follows WHERE following_id=$1",[target.id]):{rows:[{n:0}]};
- r.json({ok:true,following:false,followers:Number(c.rows[0]?.n||0)});
-}catch(e){console.error("unfollow",e);r.status(500).json({error:"Não foi possível deixar de seguir."})}});
-
-app.get("/api/friends",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const f=await pool.query(`SELECT u.name,u.email,u.code,u.avatar_mime,u.avatar_updated_at FROM friendships f JOIN users u ON u.id=f.friend_id WHERE f.user_id=$1 ORDER BY u.name`,[u.id]);const reqs=await pool.query(`SELECT u.name,u.email,u.code,u.avatar_mime,u.avatar_updated_at FROM friend_requests fr JOIN users u ON u.id=fr.sender_id WHERE fr.receiver_id=$1 AND fr.status='pending' ORDER BY fr.created_at DESC`,[u.id]);r.json({friends:f.rows.map(u2=>({...pub(u2),online:onlineByCode.has(u2.code)})),requests:reqs.rows.map(pub)})}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar amigos."})}});
-app.post("/api/friends/request",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;if(!rateLimit("friend-request:"+u.id,30,10*60*1000))return r.status(429).json({error:"Você enviou muitos pedidos de amizade. Aguarde alguns minutos."});const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Usuário não encontrado."});if(x.id===u.id)return r.status(400).json({error:"Você não pode adicionar a si mesmo."});const privacy=await privacyFor(x.id);if(privacy.friend_policy==="nobody")return r.status(403).json({error:"Este usuário não aceita solicitações de amizade."});if(privacy.friend_policy==="friends"){const fof=await pool.query("SELECT 1 FROM friendships a JOIN friendships b ON a.friend_id=b.friend_id WHERE a.user_id=$1 AND b.user_id=$2 LIMIT 1",[u.id,x.id]);if(!fof.rowCount)return r.status(403).json({error:"Este usuário aceita apenas amigos de amigos."});}const exists=await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[u.id,x.id]);if(exists.rowCount)return r.status(400).json({error:"Vocês já são amigos."});const reverse=await pool.query("SELECT 1 FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(reverse.rowCount)return r.status(400).json({error:"Esse usuário já enviou uma solicitação para você."});await pool.query("INSERT INTO friend_requests(sender_id,receiver_id,status) VALUES($1,$2,'pending') ON CONFLICT(sender_id,receiver_id) DO UPDATE SET status='pending'",[u.id,x.id]);notifyUser(x.code,"friend-request",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Novo convite de amizade",u.name+" quer ser seu amigo.",{code:u.code});r.json({message:"Solicitação enviada."})}catch(e){console.error(e);r.status(500).json({error:"Erro ao enviar solicitação."})}});
+app.get("/api/friends",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const f=await pool.query(`SELECT u.name,u.email,u.code FROM friendships f JOIN users u ON u.id=f.friend_id WHERE f.user_id=$1 ORDER BY u.name`,[u.id]);const reqs=await pool.query(`SELECT u.name,u.email,u.code FROM friend_requests fr JOIN users u ON u.id=fr.sender_id WHERE fr.receiver_id=$1 AND fr.status='pending' ORDER BY fr.created_at DESC`,[u.id]);r.json({friends:f.rows.map(u2=>({...pub(u2),online:onlineByCode.has(u2.code)})),requests:reqs.rows.map(pub)})}catch(e){console.error(e);r.status(500).json({error:"Erro ao carregar amigos."})}});
+app.post("/api/friends/request",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Usuário não encontrado."});if(x.id===u.id)return r.status(400).json({error:"Você não pode adicionar a si mesmo."});const privacy=await privacyFor(x.id);if(privacy.friend_policy==="nobody")return r.status(403).json({error:"Este usuário não aceita solicitações de amizade."});if(privacy.friend_policy==="friends"){const fof=await pool.query("SELECT 1 FROM friendships a JOIN friendships b ON a.friend_id=b.friend_id WHERE a.user_id=$1 AND b.user_id=$2 LIMIT 1",[u.id,x.id]);if(!fof.rowCount)return r.status(403).json({error:"Este usuário aceita apenas amigos de amigos."});}const exists=await pool.query("SELECT 1 FROM friendships WHERE user_id=$1 AND friend_id=$2",[u.id,x.id]);if(exists.rowCount)return r.status(400).json({error:"Vocês já são amigos."});const reverse=await pool.query("SELECT 1 FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(reverse.rowCount)return r.status(400).json({error:"Esse usuário já enviou uma solicitação para você."});await pool.query("INSERT INTO friend_requests(sender_id,receiver_id,status) VALUES($1,$2,'pending') ON CONFLICT(sender_id,receiver_id) DO UPDATE SET status='pending'",[u.id,x.id]);notifyUser(x.code,"friend-request",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Novo convite de amizade",u.name+" quer ser seu amigo.",{code:u.code});r.json({message:"Solicitação enviada."})}catch(e){console.error(e);r.status(500).json({error:"Erro ao enviar solicitação."})}});
 app.post("/api/friends/accept",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Solicitação não encontrada."});const a=await pool.query("SELECT id FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(!a.rowCount)return r.status(404).json({error:"Solicitação não encontrada."});const client=await pool.connect();try{await client.query("BEGIN");await client.query("UPDATE friend_requests SET status='accepted' WHERE id=$1",[a.rows[0].id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,x.id]);await client.query("INSERT INTO friendships(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[x.id,u.id]);await client.query("COMMIT")}catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}notifyUser(x.code,"friend-accepted",{name:u.name,code:u.code}); await addNotification(x.id,"friend","Convite aceito",u.name+" aceitou seu convite.",{code:u.code});r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao aceitar solicitação."})}});
 app.post("/api/friends/reject",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").trim().toUpperCase(),x=await getUserByCode(c);if(!x)return r.status(404).json({error:"Solicitação não encontrada."});const a=await pool.query("DELETE FROM friend_requests WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'",[x.id,u.id]);if(!a.rowCount)return r.status(404).json({error:"Solicitação não encontrada."});r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao recusar solicitação."})}});
 app.post("/api/friends/remove",async(q,r)=>{try{const u=await auth(q,r);if(!u)return;const c=String(q.body?.code||"").toUpperCase(),x=await getUserByCode(c);if(x){await pool.query("DELETE FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1)",[u.id,x.id])}r.json({ok:true})}catch(e){console.error(e);r.status(500).json({error:"Erro ao remover amigo."})}});
-function userList(room){const x=rooms.get(room);return x?[...x.values()].map(v=>({id:v.id,name:v.name,code:v.code,avatarUrl:v.avatarUrl,host:v.id===calls.get(room)})):[]}
+function userList(room){const x=rooms.get(room);return x?[...x.values()].map(v=>({id:v.id,name:v.name,code:v.code,host:v.id===calls.get(room)})):[]}
 const broadcast=room=>io.to(room).emit("room-users",userList(room)),valid=(s,id)=>!!rooms.get(s.data.room)?.has(id),ready=room=>(callReady.has(room)||callReady.set(room,new Set()),callReady.get(room));
 function cleanReady(room,id){const s=callReady.get(room);if(!s)return;s.delete(id);if(!s.size)callReady.delete(room)}
-
 io.use(async(s,n)=>{try{
  const t=String(s.handshake.auth?.token||"").trim();
  const sess=await getSession(t);
@@ -1337,31 +533,9 @@ io.on("connection",s=>{
    onlineByCode.get(meCode).add(s.id);
  }
  s.on("client-ping",t=>s.emit("client-pong",t));
- s.on("join",async({room}={})=>{const u=s.data.user;if(!u)return;
-   const requested=String(room||"geral").replace(/[^a-zA-Z0-9_-]/g,"").slice(0,48)||"geral";
-   if(requested.startsWith("srv-")){
-     const m=requested.match(/^srv-(\d+)-(\d+)$/);
-     if(!m||!(await (async()=>{const c=await pool.query("SELECT community_id FROM community_channels WHERE id=$1 LIMIT 1",[Number(m[2])]);return c.rowCount&&Number(c.rows[0].community_id)===Number(m[1])&&(await isCommunityMember(u.id,Number(m[1])))} )())){s.emit("system","Você não tem acesso a este canal.");return;}
-   }
-   s.data.room=requested;s.data.name=u.name;s.data.code=u.code;const rm=s.data.room;if(!rooms.has(rm))rooms.set(rm,new Map());rooms.get(rm).set(s.id,{id:s.id,name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)});s.join(rm);s.emit("room-users",userList(rm));s.to(rm).emit("user-joined",{id:s.id,name:u.name,code:u.code,avatarUrl:avatarUrlFor(u)});if(calls.has(rm)){const h=calls.get(rm);s.emit("call-host",h);s.emit("call-state",{active:true,host:h,ready:[...ready(rm)]})}else s.emit("call-state",{active:false,host:null,ready:[]});if(roomMusic.has(rm))s.emit("music-state",musicStateFor(rm));});
- s.on("chat",({room,text}={})=>{
-   if(room!==s.data.room)return;
-   if(!rateLimit("socket-chat:"+s.data.user.id,60,60*1000)){s.emit("system","Muitas mensagens em pouco tempo. Aguarde.");return;}
-   const t=String(text||"").trim().slice(0,1000);
-   if(t){
-     io.to(room).emit("chat",{name:s.data.name,text:t,time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})});
-   }
- });
- s.on("profile-updated",({avatarUrl,name})=>{
-   const u=s.data.user;if(!u)return;
-   if(typeof name==="string"&&name.trim())u.name=name.trim().slice(0,24);
-   u.avatarUrl=typeof avatarUrl==="string"&&avatarUrl?avatarUrl:null;
-   s.data.name=u.name;
-   const rm=s.data.room,entry=rm&&rooms.get(rm)?.get(s.id);
-   if(entry){entry.name=u.name;entry.avatarUrl=u.avatarUrl;}
-   if(rm){s.to(rm).emit("user-profile-updated",{id:s.id,name:u.name,avatarUrl:u.avatarUrl});broadcast(rm);}
- });
- s.on("call-start",({room},ack)=>{if(room!==s.data.room){if(typeof ack==="function")ack({ok:false,error:"Sala inválida"});return;}const created=!calls.has(room);if(created){calls.set(room,s.id);ready(room).add(s.id);io.to(room).emit("call-host",s.id);io.to(room).emit("call-created",{byId:s.id,name:s.data.name});io.to(room).emit("system",s.data.name+" criou uma call.");broadcast(room)}const host=calls.get(room);s.emit("call-host",host);s.emit("call-state",{active:true,host,ready:[...ready(room)]});if(typeof ack==="function")ack({ok:true,host,created,ready:[...ready(room)]});});
+ s.on("join",({room})=>{const u=s.data.user;if(!u)return;s.data.room=String(room||"geral").replace(/[^a-zA-Z0-9_-]/g,"").slice(0,32)||"geral";s.data.name=u.name;s.data.code=u.code;const rm=s.data.room;if(!rooms.has(rm))rooms.set(rm,new Map());rooms.get(rm).set(s.id,{id:s.id,name:u.name,code:u.code});s.join(rm);s.emit("room-users",userList(rm));s.to(rm).emit("user-joined",{id:s.id,name:u.name,code:u.code});if(calls.has(rm)){const h=calls.get(rm);s.emit("call-host",h);s.emit("call-state",{active:true,host:h,ready:[...ready(rm)]})}else s.emit("call-state",{active:false,host:null,ready:[]});if(roomMusic.has(rm))s.emit("music-state",musicStateFor(rm));});
+ s.on("chat",({room,text})=>{if(room!==s.data.room)return;const t=String(text||"").trim().slice(0,1000);if(t)io.to(room).emit("chat",{name:s.data.name,text:t,time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})})});
+ s.on("call-start",({room},ack)=>{if(room!==s.data.room){if(typeof ack==="function")ack({ok:false,error:"Sala inválida"});return;}if(!calls.has(room)){calls.set(room,s.id);ready(room).add(s.id);io.to(room).emit("call-host",s.id);io.to(room).emit("system",s.data.name+" criou uma call.");broadcast(room)}const host=calls.get(room);s.emit("call-host",host);s.emit("call-state",{active:true,host,ready:[...ready(room)]});if(typeof ack==="function")ack({ok:true,host,ready:[...ready(room)]});});
  s.on("call-ready",({room})=>{
    if(room!==s.data.room||!calls.has(room))return;
    ready(room).add(s.id);
@@ -1375,11 +549,9 @@ io.on("connection",s=>{
    for(const q of queued){
      if(q?.room===room&&valid(s,q.from))io.to(s.id).emit("signal",{from:q.from,data:q.data});
    }
-   for(const id of ready(room)){if(id!==s.id){io.to(id).emit("call-participant-ready",{id:s.id,name:s.data.name});io.to(id).emit("call-participant-joined",{id:s.id,name:s.data.name});}}
+   for(const id of ready(room)){if(id!==s.id)io.to(id).emit("call-participant-ready",{id:s.id,name:s.data.name});}
  });
  s.on("call-ready-request",({room})=>{if(room===s.data.room&&calls.get(room)===s.id)s.emit("call-ready-users",[...ready(room)].filter(id=>id!==s.id&&valid(s,id)))});
- s.on("call-camera-state",({room,on})=>{if(room!==s.data.room)return;s.to(room).emit("call-camera-state",{id:s.id,on:!!on})});
- s.on("call-screen-state",({room,sharing})=>{if(room!==s.data.room||!calls.has(room))return;s.to(room).emit("call-screen-state",{id:s.id,sharing:!!sharing})});
  s.on("call-leave",({room})=>{if(room===s.data.room){cleanReady(room,s.id);pendingSignals.delete(s.id);s.to(room).emit("call-participant-left",{id:s.id})}});
  function leaveRoom(s,room,{keepSocketRoom}={}){
    const rm=rooms.get(room);if(!rm)return;
@@ -1407,17 +579,15 @@ io.on("connection",s=>{
  s.on("call-end",({room})=>{if(room!==s.data.room||calls.get(room)!==s.id)return;calls.delete(room);callReady.delete(room);roomMusic.delete(room);io.to(room).emit("call-ended");io.to(room).emit("call-state",{active:false,host:null,ready:[]});io.to(room).emit("music-stop");io.to(room).emit("system",s.data.name+" encerrou a call.");broadcast(room)});
  function musicStateFor(room){const st=roomMusic.get(room);if(!st)return null;const position=st.paused?Number(st.position||0):Math.max(0,Number(st.position||0)+(Date.now()-Number(st.startedAt||Date.now()))/1000);return {...st,position};}
  function cleanMusicTrack(t){const x={id:String(t?.id||"").replace(/[^A-Za-z0-9_-]/g,"").slice(0,80),title:String(t?.title||"Sem título").slice(0,120),artist:String(t?.artist||"Artista desconhecido").slice(0,80),duration:Number(t?.duration||0)};return x.id?x:null;}
- function musicParticipant(s,room){return room===s.data.room&&calls.has(room);}
- function musicController(s,room){return room===s.data.room&&calls.get(room)===s.id;}
- // Confirmação explícita dos comandos evita falsos "sucessos" no painel.
- function denyMusicControl(s,ack){const msg="Só o criador da call pode controlar a música.";s.emit("music-command-error",msg);if(typeof ack==="function")ack({ok:false,error:msg});return false;}
- s.on("music-play",({room,track},ack)=>{if(!musicParticipant(s,room)){const msg="Entre em uma call ativa para usar o bot de música.";s.emit("music-command-error",msg);if(typeof ack==="function")ack({ok:false,error:msg});return;}const clean=cleanMusicTrack(track);if(!clean){const msg="Faixa inválida. Escolha uma música válida.";s.emit("music-command-error",msg);if(typeof ack==="function")ack({ok:false,error:msg});return;}let st=roomMusic.get(room);if(st){if(st.queue.length>=50){const msg="A fila está cheia (máximo 50).";s.emit("music-command-error",msg);if(typeof ack==="function")ack({ok:false,error:msg});return;}st.queue.push(clean);io.to(room).emit("music-state",musicStateFor(room));io.to(room).emit("system",s.data.name+" adicionou 🎵 "+clean.title+" à fila.");if(typeof ack==="function")ack({ok:true,queued:true,track:clean});return;}st={track:clean,queue:[],hostId:s.id,startedAt:Date.now(),position:0,paused:false,volume:.7};roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));io.to(room).emit("system",s.data.name+" colocou 🎵 "+clean.title+" para tocar.");if(typeof ack==="function")ack({ok:true,queued:false,track:clean});});
- s.on("music-next",({room},ack)=>{if(!musicController(s,room))return denyMusicControl(s,ack);const st=roomMusic.get(room);if(!st){if(typeof ack==="function")ack({ok:true,stopped:true});return;}const n=st.queue.shift();if(n){st.track=n;st.startedAt=Date.now();st.position=0;st.paused=false;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));if(typeof ack==="function")ack({ok:true,track:n});}else{roomMusic.delete(room);io.to(room).emit("music-stop");io.to(room).emit("system","🎵 A fila terminou.");if(typeof ack==="function")ack({ok:true,stopped:true});}});
- s.on("music-pause",({room},ack)=>{if(!musicController(s,room))return denyMusicControl(s,ack);const st=roomMusic.get(room);if(!st){if(typeof ack==="function")ack({ok:true});return;}if(st.paused){if(typeof ack==="function")ack({ok:true,already:true});return;}st.position=musicStateFor(room).position;st.paused=true;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));if(typeof ack==="function")ack({ok:true});});
- s.on("music-resume",({room},ack)=>{if(!musicController(s,room))return denyMusicControl(s,ack);const st=roomMusic.get(room);if(!st){if(typeof ack==="function")ack({ok:true});return;}if(!st.paused){if(typeof ack==="function")ack({ok:true,already:true});return;}st.startedAt=Date.now();st.paused=false;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));if(typeof ack==="function")ack({ok:true});});
- s.on("music-volume",({room,volume},ack)=>{if(!musicController(s,room))return denyMusicControl(s,ack);const st=roomMusic.get(room);if(!st){const msg="Nenhuma música está tocando.";if(typeof ack==="function")ack({ok:false,error:msg});return;}st.volume=Math.max(0,Math.min(1,Number(volume)||0));roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));if(typeof ack==="function")ack({ok:true,volume:st.volume});});
- s.on("music-queue",({room},ack)=>{if(room!==s.data.room){if(typeof ack==="function")ack({ok:false,error:"Sala inválida."});return;}const q=roomMusic.get(room)?.queue||[];s.emit("system",q.length?"🎵 Fila ("+q.length+"):\n"+q.slice(0,15).map((x,i)=>(i+1)+". "+x.title+" — "+x.artist).join("\n"):"🎵 A fila está vazia.");if(typeof ack==="function")ack({ok:true,queue:q});});
- s.on("music-stop",({room},ack)=>{if(!musicController(s,room))return denyMusicControl(s,ack);roomMusic.delete(room);io.to(room).emit("music-stop");io.to(room).emit("system",s.data.name+" parou a música e limpou a fila.");if(typeof ack==="function")ack({ok:true});});
+ function musicParticipant(s,room){return room===s.data.room&&calls.has(room)&&ready(room).has(s.id);}
+ function musicController(s,room){return room===s.data.room&&calls.get(room)===s.id&&ready(room).has(s.id);}
+ s.on("music-play",({room,track})=>{if(!musicParticipant(s,room)){s.emit("music-command-error","Entre em uma call ativa para usar o bot de música.");return;}const clean=cleanMusicTrack(track);if(!clean)return;let st=roomMusic.get(room);if(st){if(st.queue.length>=50){s.emit("music-command-error","A fila está cheia (máximo 50).");return;}st.queue.push(clean);io.to(room).emit("music-state",musicStateFor(room));io.to(room).emit("system",s.data.name+" adicionou 🎵 "+clean.title+" à fila.");return;}st={track:clean,queue:[],hostId:s.id,startedAt:Date.now(),position:0,paused:false,volume:.7};roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));io.to(room).emit("system",s.data.name+" colocou 🎵 "+clean.title+" para tocar.");});
+ s.on("music-next",({room})=>{if(!musicController(s,room))return;const st=roomMusic.get(room);if(!st)return;const n=st.queue.shift();if(n){st.track=n;st.startedAt=Date.now();st.position=0;st.paused=false;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));}else{roomMusic.delete(room);io.to(room).emit("music-stop");io.to(room).emit("system","🎵 A fila terminou.");}});
+ s.on("music-pause",({room})=>{if(!musicController(s,room))return;const st=roomMusic.get(room);if(!st||st.paused)return;st.position=musicStateFor(room).position;st.paused=true;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));});
+ s.on("music-resume",({room})=>{if(!musicController(s,room))return;const st=roomMusic.get(room);if(!st?.paused)return;st.startedAt=Date.now();st.paused=false;roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));});
+ s.on("music-volume",({room,volume})=>{if(!musicController(s,room))return;const st=roomMusic.get(room);if(!st)return;st.volume=Math.max(0,Math.min(1,Number(volume)||0));roomMusic.set(room,st);io.to(room).emit("music-state",musicStateFor(room));});
+ s.on("music-queue",({room})=>{if(room!==s.data.room)return;const q=roomMusic.get(room)?.queue||[];s.emit("system",q.length?"🎵 Fila ("+q.length+"):\n"+q.slice(0,15).map((x,i)=>(i+1)+". "+x.title+" — "+x.artist).join("\n"):"🎵 A fila está vazia.");});
+ s.on("music-stop",({room})=>{if(!musicController(s,room))return;roomMusic.delete(room);io.to(room).emit("music-stop");io.to(room).emit("system",s.data.name+" parou a música e limpou a fila.");});
  s.on("signal",({to,data})=>{
    const rm=s.data.room;
    if(!rm||!to||!data||!valid(s,to)||!calls.has(rm))return;
@@ -1455,20 +625,12 @@ io.on("connection",s=>{
  s.on("disconnect",()=>{
    pendingSignals.delete(s.id);
    for(const [target,q] of pendingSignals){const filtered=q.filter(x=>x.from!==s.id);if(filtered.length)pendingSignals.set(target,filtered);else pendingSignals.delete(target);}
-const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}
- // A fila é mantida durante desconexões transitórias; o heartbeat/limpeza automática decide quando expirar.
- const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
+const meCode=s.data.user?.code;if(meCode){const set=onlineByCode.get(meCode);if(set){set.delete(s.id);if(!set.size)onlineByCode.delete(meCode);}}const room=s.data.room;if(!room)return;if(!rooms.get(room))return;leaveRoom(s,room,{keepSocketRoom:true})})
 });
-setInterval(async()=>{
- const now=Date.now();
- for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);
- for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);
- for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);
- try{await pool.query("DELETE FROM random_queue WHERE joined_at < NOW()-INTERVAL '10 minutes' OR last_seen_at < NOW()-INTERVAL '30 seconds'");await pool.query("UPDATE random_matches SET status='expired' WHERE status='active' AND expires_at<NOW()");await pool.query("DELETE FROM random_matches WHERE status<>'active' AND created_at<NOW()-INTERVAL '1 day'");await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()");await pool.query("DELETE FROM email_tokens WHERE expires_at<NOW() OR (used_at IS NOT NULL AND created_at<NOW()-INTERVAL '7 days')")}catch(e){}
-},30*60*1000);
+setInterval(async()=>{const now=Date.now();for(const [t,v] of sessions)if(v.expires<now)sessions.delete(t);for(const [k,v] of rateLimits)if(!v.length||now-v[v.length-1]>10*60*1000)rateLimits.delete(k);for(const [k,v] of musicTokens)if(v.expires<now)musicTokens.delete(k);try{await pool.query("DELETE FROM app_sessions WHERE expires_at<NOW()")}catch(e){}},30*60*1000);
 const PORT=Number(process.env.PORT)||3000;
 server.listen(PORT,"0.0.0.0",()=>{
-  console.log("FreeChat v1.6.6 server ativo na porta "+PORT);
+  console.log("Conversa Live v3.0.6 server ativo na porta "+PORT);
   initDbWithRetry();
 });
 async function initDbWithRetry(){
