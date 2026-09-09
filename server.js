@@ -1342,6 +1342,14 @@ app.get("/api/users/:code/profile",async(q,r)=>{try{
  const c=counts.rows[0]||{};const rr=rel.rows[0]||{};
  r.json({user:pub(target),followers:Number(c.followers||0),following:Number(c.following||0),posts:Number(c.posts||0),isFollowing:!!rr.following,isFriend:!!rr.friend});
 }catch(e){console.error("user-profile",e);r.status(500).json({error:"Não foi possível carregar o perfil."})}});
+app.get("/api/follows/following",async(q,r)=>{try{
+ const me=await auth(q,r);if(!me)return;
+ const x=await pool.query(`SELECT u.name,u.email,u.code,u.avatar_mime,u.avatar_updated_at
+   FROM user_follows uf JOIN users u ON u.id=uf.following_id
+   WHERE uf.follower_id=$1 AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.user_id=$1 AND b.blocked_id=u.id) OR (b.user_id=u.id AND b.blocked_id=$1))
+   ORDER BY uf.created_at DESC`,[me.id]);
+ r.json({following:x.rows.map(u=>({...pub(u),online:onlineByCode.has(u.code)}))});
+}catch(e){console.error("following-list",e);r.status(500).json({error:"Não foi possível carregar quem você segue."})}});
 app.post("/api/follows/:code",async(q,r)=>{try{
  const me=await auth(q,r);if(!me)return;
  if(!rateLimit("follow:"+me.id,60,60*1000))return r.status(429).json({error:"Você fez muitas ações de seguir. Aguarde um momento."});
