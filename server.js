@@ -32,51 +32,6 @@ pool.on("error",e=>console.error("PostgreSQL pool error:",e?.message||e));
 let dbReady=false;
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024},fileFilter:(req,file,cb)=>{const mime=/^(image\/(jpeg|png|webp|gif)|video\/(mp4|webm|quicktime|ogg))$/i.test(file.mimetype);const name=String(file.originalname||"").normalize("NFKC");const ext=(name.match(/\.([A-Za-z0-9]{1,8})$/)||[])[1]?.toLowerCase();const allowed=(file.mimetype.startsWith("image/")?{jpeg:"image/jpeg",jpg:"image/jpeg",png:"image/png",webp:"image/webp",gif:"image/gif"}:{mp4:"video/mp4",webm:"video/webm",mov:"video/quicktime",ogg:"video/ogg",oga:"video/ogg"});const ok=!!ext&&mime&&allowed[ext]===file.mimetype.toLowerCase()&&!/\.(php|phtml|js|html|svg|exe|bat|cmd|sh)(\.|$)/i.test(name);cb(ok?null:new Error("Arquivo não permitido. Use uma imagem JPG/PNG/WEBP/GIF ou vídeo MP4/WebM/MOV/OGG."),ok)}});
 const sessions=new Map(),rooms=new Map(),calls=new Map(),callReady=new Map(),pendingSignals=new Map(),rateLimits=new Map(),roomMusic=new Map(),musicTokens=new Map();
-
-// FreeChat moderation: blocks clearly illegal, privacy-invasive and inappropriate text.
-// This is intentionally conservative for obvious categories; it is not a substitute for
-// human moderation or image/video content classification.
-const MODERATION_TERMS=[
- "explosivo","bomba caseira","fabricação de bomba","fabricar bomba","como fazer bomba",
- "arma ilegal","comprar arma ilegal","tráfico de drogas","trafico de drogas","vender drogas",
- "comprar drogas","como fabricar droga","falsificar documento","documento falso","fraudar",
- "golpe bancário","roubar conta","roubar senha","phishing","invadir conta","hackear conta",
- "explorar vulnerabilidade","malware","ransomware","stalkear","doxxing",
- "pornografia infantil","abuso infantil","exploração sexual infantil","conteúdo sexual de menor",
- "nudez de menor","sexo com menor","estupro","violência sexual",
- "pornografia","nudes","nude","sexo explícito","sexo explicito","orgão sexual","orgao sexual",
- "pênis","penis","vagina","masturbação","masturbacao"
-];
-const PRIVATE_PATTERNS=[
- /\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/, // CPF
- /\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?9?\d{4}[-\s]?\d{4}\b/, // Brazilian phone
- /\b\d{5}-?\d{3}\b/, // CEP
- /\b[\w.+-]+@[\w-]+\.[\w.-]+\b/i, // email
- /\b(?:senha|password|token|api[_ -]?key)\s*[:=]\s*\S+/i,
- /\b(?:meu endereço|meu endereco|moro em|minha casa|meu cpf|meu telefone|meu número|meu numero)\b/i
-];
-function normalizeModerationText(v){
- return String(v||"").normalize("NFKC").toLowerCase()
-   .normalize("NFD").replace(/[\u0300-\u036f]/g,"")
-   .replace(/[@4]/g,"a").replace(/[3]/g,"e").replace(/[1!]/g,"i")
-   .replace(/[0]/g,"o").replace(/[$5]/g,"s")
-   .replace(/(.)\1{3,}/g,"$1$1");
-}
-function moderateText(value){
- const raw=String(value||"").trim();
- if(!raw)return {ok:true};
- for(const re of PRIVATE_PATTERNS) if(re.test(raw)) return {ok:false,reason:"Não publique dados pessoais, senhas, tokens ou informações privadas."};
- const n=normalizeModerationText(raw).replace(/[^a-z0-9\s]/g," ");
- for(const term of MODERATION_TERMS){
-   const t=normalizeModerationText(term);
-   if(n.includes(t)) return {ok:false,reason:"Este conteúdo foi bloqueado por violar as regras do FreeChat."};
- }
- return {ok:true};
-}
-function moderationResponse(r,reason){
- return r.status(422).json({error:reason||"Conteúdo bloqueado pelas regras de segurança do FreeChat."});
-}
-
 function validFileSignature(file){try{const b=file?.buffer;if(!b||!b.length)return false;const mime=String(file.mimetype||"").toLowerCase();if(mime==="image/jpeg")return b[0]===0xff&&b[1]===0xd8&&b[2]===0xff;if(mime==="image/png")return b.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]));if(mime==="image/gif")return b.subarray(0,6).toString()==="GIF87a"||b.subarray(0,6).toString()==="GIF89a";if(mime==="image/webp")return b.subarray(0,4).toString()==="RIFF"&&b.subarray(8,12).toString()==="WEBP";if(mime==="video/ogg")return b.subarray(0,4).toString()==="OggS";if(mime==="video/webm")return b.subarray(0,4).equals(Buffer.from([0x1a,0x45,0xdf,0xa3]));if(mime==="video/mp4"||mime==="video/quicktime")return b.length>12&&b.subarray(4,8).toString()==="ftyp";return false}catch(e){return false}}
 function safeFilename(name){return String(name||"media").normalize("NFKC").replace(/[^A-Za-z0-9._ -]/g,"_").replace(/\.{2,}/g,".").slice(0,120)||"media";}
 
@@ -910,7 +865,7 @@ app.get("/api/feed/:id/comments",async(q,r)=>{try{
  r.json({comments:x.rows.map(c=>({...c,avatarUrl:avatarUrlFor(c)}))});
 }catch(e){console.error(e);r.status(500).json({error:"Não foi possível carregar os comentários."})}});
 app.post("/api/feed/:id/comments",async(q,r)=>{try{
- const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),body=String(q.body?.body||"").trim();const moderation=moderateText(body);if(!moderation.ok)return moderationResponse(r,moderation.reason);if(!Number.isSafeInteger(id)||id<1||!body)return r.status(400).json({error:"Comentário inválido."});if(body.length>800)return r.status(400).json({error:"O comentário pode ter no máximo 800 caracteres."});
+ const u=await auth(q,r);if(!u)return;const id=Number(q.params.id),body=String(q.body?.body||"").trim();if(!Number.isSafeInteger(id)||id<1||!body)return r.status(400).json({error:"Comentário inválido."});if(body.length>800)return r.status(400).json({error:"O comentário pode ter no máximo 800 caracteres."});
  const visible=await canViewFeedPost(u.id,id);if(visible===null)return r.status(404).json({error:"Publicação não encontrada."});if(visible===false)return r.status(403).json({error:"Você não pode comentar nesta publicação."});
  const post=await pool.query("SELECT author_id FROM social_posts WHERE id=$1",[id]);
  const x=await pool.query(`INSERT INTO social_comments(post_id,user_id,body) VALUES($1,$2,$3) RETURNING id,body,created_at`,[id,u.id,body]);
@@ -926,7 +881,6 @@ app.post("/api/feed/:id/save",async(q,r)=>{try{
 app.post("/api/feed",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
  const body=String(q.body?.body||"").trim();
- const moderation=moderateText(body);if(!moderation.ok)return moderationResponse(r,moderation.reason);
  if(body.length<1)return r.status(400).json({error:"Escreva algo antes de publicar."});
  if(body.length>1000)return r.status(400).json({error:"A publicação pode ter no máximo 1000 caracteres."});
  const x=await pool.query("INSERT INTO social_posts(author_id,body) VALUES($1,$2) RETURNING id,body,created_at",[u.id,body]);
@@ -941,7 +895,6 @@ app.post("/api/feed/media",(req,res,next)=>{
 },async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
  const body=String(q.body?.body||"").trim();
- const moderation=moderateText(body);if(!moderation.ok)return moderationResponse(r,moderation.reason);
  const duration=Number(q.body?.duration||0);
  if(body.length>1000)return r.status(400).json({error:"A publicação pode ter no máximo 1000 caracteres."});
  if(!q.file)return r.status(400).json({error:"Escolha uma foto ou vídeo."});
@@ -1264,7 +1217,6 @@ app.post("/api/messages",async(q,r)=>{
  try{
   const me=await auth(q,r);if(!me)return;
   const code=String(q.body?.code||"").trim().toUpperCase(),body=String(q.body?.body||"").trim();
-  const moderation=moderateText(body);if(!moderation.ok)return moderationResponse(r,moderation.reason);
   if(!body)return r.status(400).json({error:"Mensagem vazia."});
   if(body.length>4000)return r.status(400).json({error:"Mensagem muito longa."});
   if(!rateLimit("dm:"+me.id,40,60*1000))return r.status(429).json({error:"Muitas mensagens em pouco tempo. Aguarde um instante."});
@@ -1281,7 +1233,6 @@ app.post("/api/messages/media",(req,res,next)=>{upload.single("file")(req,res,er
  try{
   const me=await auth(q,r);if(!me)return;
   const code=String(q.body?.code||"").trim().toUpperCase(),caption=String(q.body?.body||"").trim();
-  const moderation=moderateText(caption);if(!moderation.ok)return moderationResponse(r,moderation.reason);
   if(caption.length>4000)return r.status(400).json({error:"Legenda muito longa."});
   if(!q.file)return r.status(400).json({error:"Escolha uma foto ou vídeo."});
   if(q.file.size>20*1024*1024)return r.status(413).json({error:"Arquivo muito grande. O limite é 20 MB."});
@@ -1342,14 +1293,6 @@ app.get("/api/users/:code/profile",async(q,r)=>{try{
  const c=counts.rows[0]||{};const rr=rel.rows[0]||{};
  r.json({user:pub(target),followers:Number(c.followers||0),following:Number(c.following||0),posts:Number(c.posts||0),isFollowing:!!rr.following,isFriend:!!rr.friend});
 }catch(e){console.error("user-profile",e);r.status(500).json({error:"Não foi possível carregar o perfil."})}});
-app.get("/api/follows/following",async(q,r)=>{try{
- const me=await auth(q,r);if(!me)return;
- const x=await pool.query(`SELECT u.name,u.email,u.code,u.avatar_mime,u.avatar_updated_at
-   FROM user_follows uf JOIN users u ON u.id=uf.following_id
-   WHERE uf.follower_id=$1 AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.user_id=$1 AND b.blocked_id=u.id) OR (b.user_id=u.id AND b.blocked_id=$1))
-   ORDER BY uf.created_at DESC`,[me.id]);
- r.json({following:x.rows.map(u=>({...pub(u),online:onlineByCode.has(u.code)}))});
-}catch(e){console.error("following-list",e);r.status(500).json({error:"Não foi possível carregar quem você segue."})}});
 app.post("/api/follows/:code",async(q,r)=>{try{
  const me=await auth(q,r);if(!me)return;
  if(!rateLimit("follow:"+me.id,60,60*1000))return r.status(429).json({error:"Você fez muitas ações de seguir. Aguarde um momento."});
