@@ -426,6 +426,25 @@ async function isCommunityMember(userId,communityId){
 async function communitySummary(row,userId){
  return {id:Number(row.id),name:row.name,description:row.description||"",is_public:!!row.is_public,invite_code:Number(row.owner_id)===Number(userId)?row.invite_code:null,owner_id:Number(row.owner_id),member_count:Number(row.member_count||0),joined:!!row.joined,role:row.role||null,created_at:row.created_at};
 }
+// TURN dinâmico via Cloudflare Realtime. A chave secreta (CLOUDFLARE_TURN_API_TOKEN)
+// nunca é exposta ao navegador — o cliente só recebe credenciais de curta duração
+// (TTL) geradas na hora, exatamente como a Cloudflare recomenda.
+app.get("/api/turn-credentials",async(q,r)=>{
+  const u=await auth(q,r);if(!u)return;
+  const keyId=process.env.CLOUDFLARE_TURN_KEY_ID,token=process.env.CLOUDFLARE_TURN_API_TOKEN;
+  if(!keyId||!token)return r.json({ok:false,iceServers:[]}); // Cloudflare não configurado; o cliente cai no TURN público de fallback.
+  if(!rateLimit("turn-credentials:"+u.id,10,60*1000))return r.status(429).json({error:"Muitas tentativas. Aguarde um instante."});
+  try{
+    const resp=await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(keyId)}/credentials/generate-ice-servers`,{
+      method:"POST",
+      headers:{Authorization:"Bearer "+token,"Content-Type":"application/json"},
+      body:JSON.stringify({ttl:4*60*60}) // 4h — mais que suficiente para qualquer call
+    });
+    if(!resp.ok){console.error("cloudflare-turn",resp.status,await resp.text().catch(()=>""));return r.json({ok:false,iceServers:[]});}
+    const data=await resp.json();
+    r.json({ok:true,iceServers:data.iceServers||[]});
+  }catch(e){console.error("cloudflare-turn",e);r.json({ok:false,iceServers:[]});}
+});
 app.get("/api/servers",async(q,r)=>{try{
  const u=await auth(q,r);if(!u)return;
  const search=String(q.query?.q||"").replace(/\s+/g," ").trim().slice(0,60);
