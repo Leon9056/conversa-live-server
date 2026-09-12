@@ -330,14 +330,14 @@ function clearFailedLogin(key){failedLogins.delete(key);}
 async function securityEvent(userId,type,meta={}){try{await pool.query("INSERT INTO security_events(user_id,event_type,ip_hash,user_agent,meta) VALUES($1,$2,$3,$4,$5)",[userId||null,type,meta.ip?crypto.createHash("sha256").update(String(process.env.SESSION_SECRET||"freechat")+String(meta.ip)).digest("hex"):null,String(meta.ua||"").slice(0,300),JSON.stringify(meta.data||{})])}catch(e){console.error("security-event",e)}}
 async function getUserByEmail(email){
   const x=await pool.query(
-    "SELECT id,name,email,code,salt,password_hash,created_at,email_verified_at,avatar_mime,avatar_updated_at FROM users WHERE email=$1 LIMIT 1",
+    "SELECT id,name,email,code,salt,password_hash,created_at,email_verified_at,avatar_mime,avatar_updated_at,banned_at,ban_reason FROM users WHERE email=$1 LIMIT 1",
     [cleanEmail(email)]
   );
   return x.rows[0]||null;
 }
 async function getUserByCode(value){
   const x=await pool.query(
-    "SELECT id,name,email,code,salt,password_hash,created_at,email_verified_at,avatar_mime,avatar_updated_at FROM users WHERE code=$1 LIMIT 1",
+    "SELECT id,name,email,code,salt,password_hash,created_at,email_verified_at,avatar_mime,avatar_updated_at,banned_at,ban_reason FROM users WHERE code=$1 LIMIT 1",
     [String(value??"").trim().toUpperCase()]
   );
   return x.rows[0]||null;
@@ -423,7 +423,7 @@ async function isCommunityMember(userId,communityId){
  const x=await pool.query("SELECT role FROM community_members WHERE community_id=$1 AND user_id=$2 LIMIT 1",[cid,uid]);
  return x.rows[0]||null;
 }
-async function communitySummary(row,userId){
+function communitySummary(row,userId){
  return {id:Number(row.id),name:row.name,description:row.description||"",is_public:!!row.is_public,invite_code:Number(row.owner_id)===Number(userId)?row.invite_code:null,owner_id:Number(row.owner_id),member_count:Number(row.member_count||0),joined:!!row.joined,role:row.role||null,created_at:row.created_at};
 }
 // TURN dinâmico via Cloudflare Realtime. A chave secreta (CLOUDFLARE_TURN_API_TOKEN)
@@ -600,6 +600,14 @@ app.post("/api/admin/users/:id/ban",async(q,r)=>{try{
   const reason=String(q.body?.reason||"").trim().slice(0,300)||null;
   await pool.query("UPDATE users SET banned_at=NOW(),ban_reason=$2 WHERE id=$1",[id,reason]);
   await securityEvent(id,"ADMIN_BANNED",{data:{by:admin.email,reason}});
+  // Derruba imediatamente qualquer conexão ativa dessa pessoa — sem isso,
+  // quem já estava com o app aberto continuaria em calls/chat até recarregar.
+  try{
+    const banned=await pool.query("SELECT code FROM users WHERE id=$1",[id]);
+    const code=banned.rows[0]?.code;
+    const sockets=code?onlineByCode.get(code):null;
+    if(sockets){for(const sid of [...sockets]){io.to(sid).emit("account-banned",{reason});io.sockets.sockets.get(sid)?.disconnect(true);}}
+  }catch(e){console.error("admin-ban-disconnect",e);}
   r.json({ok:true});
 }catch(e){console.error("admin-ban",e);r.status(500).json({error:"Não foi possível suspender o usuário."})}});
 
@@ -1188,7 +1196,7 @@ app.get("/api/messages/conversations",async(q,r)=>{
          (SELECT COUNT(*)::int FROM direct_messages um WHERE um.sender_id=r.other_id AND um.receiver_id=$1 AND um.read_at IS NULL) AS unread_count
   FROM ranked r JOIN users u ON u.id=r.other_id
   WHERE r.rn=1
-  ORDER BY pinned DESC,r.last_created_at DESC NULLS LAST`,[me.id]);
+  ORDER BY pinned DESC,last_created_at DESC NULLS LAST`,[me.id]);
   r.json({conversations:x.rows.map(v=>({code:v.code,name:v.name,avatarUrl:v.avatar_mime?`/api/avatar/${encodeURIComponent(v.code)}?v=${Number(v.avatar_updated_at||0)}`:null,lastMessage:{id:v.last_message_id,body:v.last_body||"",created_at:v.last_created_at,sender_id:v.last_sender_id,mediaType:v.last_media_type||null},pinned:!!v.pinned,unread:Number(v.unread_count||0)}))});
  }catch(e){console.error("dm-conversations",e);r.status(500).json({error:"Não foi possível carregar suas conversas."})}
 });
@@ -1345,6 +1353,7 @@ io.use(async(s,n)=>{try{
  if(!sess)return n(new Error("Sessão expirada"));
  const u=await getUserByEmail(sess.email);
  if(!u)return n(new Error("Sessão inválida"));
+ if(u.banned_at)return n(new Error("Conta suspensa"));
  sess.expires=Date.now()+SESSION_TTL_MS;
  await pool.query("UPDATE app_sessions SET expires_at=to_timestamp($2/1000.0),last_seen_at=NOW() WHERE token=$1",[sessionHash(t),sess.expires]);
  s.data.user=u;n();
